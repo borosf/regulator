@@ -125,6 +125,7 @@ impl RegulatorApp {
             let mut last_len = 0usize;
             let mut cal_state = CalibrationState::new();
             let mut cal_cooldown = 0u32;
+            let mut analyzer = Analyzer::new(SAMPLE_RATE);
             loop {
                 let mut p = params_arc.lock().unwrap_or_else(|e| e.into_inner());
                 if p.calibrating {
@@ -181,7 +182,6 @@ impl RegulatorApp {
                 }
                 drop(p);
                 let p2 = params_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let mut analyzer = Analyzer::new(SAMPLE_RATE);
                 analyzer.bph = p2.bph;
                 analyzer.lift_angle = p2.lift_angle;
                 analyzer.noise_suppressor = p2.noise_suppressor;
@@ -198,12 +198,23 @@ impl RegulatorApp {
                     }
                     r
                 } else if let Some(ring) = &ring {
-                    let buf = ring.lock().unwrap_or_else(|e| e.into_inner());
-                    if buf.data.len() >= block {
-                        win_start_s = (buf.total - block as u64) as f64 / SAMPLE_RATE as f64;
-                        analyzer.analyze(&buf.data[buf.data.len() - block..])
-                    } else {
-                        None
+                    // Copy the window out under the lock (a fraction of a
+                    // millisecond), then analyze without holding it so the
+                    // capture relay never stalls.
+                    let window = {
+                        let buf = ring.lock().unwrap_or_else(|e| e.into_inner());
+                        if buf.data.len() >= block {
+                            Some((buf.total, buf.data[buf.data.len() - block..].to_vec()))
+                        } else {
+                            None
+                        }
+                    };
+                    match window {
+                        Some((total, w)) => {
+                            win_start_s = (total - block as u64) as f64 / SAMPLE_RATE as f64;
+                            analyzer.analyze(&w)
+                        }
+                        None => None,
                     }
                 } else {
                     None
@@ -295,6 +306,17 @@ impl eframe::App for RegulatorApp {
                 ui.label(egui::RichText::new("s/d").monospace().size(16.0).color(egui::Color32::GRAY));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let p = self.params.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if ui.button("export").clicked() {
+                        self.last_export = chart::export_chart(&self.trace, &self.result, &self.params);
+                    }
+                    if let Some(path) = &self.last_export {
+                        ui.label(
+                            egui::RichText::new(format!("saved {path}"))
+                                .monospace()
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(120, 220, 120)),
+                        );
+                    }
                     ui.label(
                         egui::RichText::new(format!(
                             "{}  {}",
@@ -408,25 +430,6 @@ impl eframe::App for RegulatorApp {
                 }
             });
 
-        // Export needs the trace; run it from a small panel-level button on
-        // the top bar, right side.
-        egui::TopBottomPanel::top("export").show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                if ui.button("export chart").clicked() {
-                    self.last_export = chart::export_chart(&self.trace, &self.result, &self.params);
-                }
-                if let Some(path) = &self.last_export {
-                    ui.label(
-                        egui::RichText::new(format!("saved {path}"))
-                            .monospace()
-                            .size(12.0)
-                            .color(egui::Color32::from_rgb(120, 220, 120)),
-                    );
-                }
-            });
-        });
-
         ctx.request_repaint_after(Duration::from_millis(200));
     }
 }
@@ -468,8 +471,9 @@ fn draw_trace(ui: &mut egui::Ui, trace: &[TracePoint]) {
     }
     let bottom = rect.bottom();
     let h = rect.height();
+    let t_end = trace.last().map(|q| q.t).unwrap_or(0.0);
     for p in trace {
-        let age = trace.last().map(|q| q.t).unwrap_or(0.0) - p.t;
+        let age = t_end - p.t;
         if age > 60.0 {
             continue;
         }
