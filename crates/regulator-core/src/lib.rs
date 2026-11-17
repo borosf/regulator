@@ -12,6 +12,7 @@
 //!    the balance amplitude from the pulse widths.
 
 pub mod analyze;
+pub mod dsp2;
 pub mod calibrate;
 pub mod filters;
 pub mod signal;

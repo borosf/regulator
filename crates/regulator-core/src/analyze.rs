@@ -64,7 +64,7 @@ impl FftCache {
 }
 
 /// Snap a detected beats-per-hour value to the nearest standard beat rate.
-fn snap_bph(detected: f64) -> f64 {
+pub(crate) fn snap_bph(detected: f64) -> f64 {
     const STANDARDS: [f64; 9] = [
         12000.0, 14400.0, 18000.0, 19800.0, 21600.0, 25200.0, 28800.0, 36000.0, 43200.0,
     ];
@@ -267,7 +267,7 @@ impl Analyzer {
 
     /// Autocorrelation of s (length n) via cached FFT plans; result has n
     /// points. Unlike tg, the plans are created once per length and reused.
-    fn autocorrelate(&self, s: &[f32], n: usize) -> Vec<f32> {
+    pub(crate) fn autocorrelate(&self, s: &[f32], n: usize) -> Vec<f32> {
         let mut fft = self.fft.borrow_mut();
         let forward = fft.plan(2 * n, FftDirection::Forward);
         let inverse = fft.plan(2 * n, FftDirection::Inverse);

@@ -19,8 +19,23 @@ pub struct SyntheticWatch {
 }
 
 impl SyntheticWatch {
-    /// Generate `duration_s` seconds of audio at `sample_rate`.
+    /// Generate `duration_s` seconds of audio at `sample_rate` with the
+    /// default background noise (the classic demo signal).
     pub fn generate(&self, sample_rate: u32, duration_s: f64) -> Vec<f32> {
+        let mut out = self.generate_clean(sample_rate, duration_s);
+        let mut noise_rng = 0xdead_beefu64;
+        for v in out.iter_mut() {
+            noise_rng = noise_rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let r = ((noise_rng >> 11) as i64 % 2000) as f64 / 1000.0 - 1.0;
+            *v += (r * 0.02) as f32;
+        }
+        out
+    }
+
+    /// Generate the clean tick train with no background noise.
+    pub fn generate_clean(&self, sample_rate: u32, duration_s: f64) -> Vec<f32> {
         // Ticks (tic, toc, tic, ...) occur every 3600/bph seconds; the
         // same-type period the analyzer locks onto is twice that.
         let nominal_period = 2.0 * 3600.0 / self.bph as f64;
@@ -84,15 +99,6 @@ impl SyntheticWatch {
             // A little jitter so the signal is not perfectly periodic.
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
             t += ((rng >> 33) as f64 / u32::MAX as f64 - 0.5) * 1e-5;
-        }
-        // Background noise.
-        let mut noise_rng = 0xdead_beefu64;
-        for v in out.iter_mut() {
-            noise_rng = noise_rng
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let r = ((noise_rng >> 11) as i64 % 2000) as f64 / 1000.0 - 1.0;
-            *v += (r * 0.02) as f32;
         }
         out
     }
