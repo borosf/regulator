@@ -162,7 +162,7 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, s: &Settings) {
     let line = Line::from(vec![
         Span::styled(format!(" {} ", s.source), Style::default().bg(Color::DarkGray)),
         Span::raw(format!(
-            " bph:{bph}  lift:{:.0}°  noise:{}  ",
+            " bph:{bph}  lift:{:.0}°  noise:{}{cal}  ",
             s.lift_angle,
             if s.noise_suppressor { "on" } else { "off" }
         )),

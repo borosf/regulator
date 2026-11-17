@@ -12,7 +12,9 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use regulator_core::{CalStatus, CalibrationState, Analyzer, SyntheticWatch, TimingResult};
+use regulator_core::{Analyzer, SyntheticWatch, TimingResult};
+#[cfg(feature = "audio")]
+use regulator_core::{CalStatus, CalibrationState};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

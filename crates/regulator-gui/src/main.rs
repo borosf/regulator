@@ -7,7 +7,7 @@ mod audio;
 mod chart;
 
 use eframe::egui;
-use regulator_core::{CalStatus, CalibrationState, Analyzer, SyntheticWatch, TimingResult};
+use regulator_core::{CalStatus, CalibrationState, ClockCal, Analyzer, SyntheticWatch, TimingResult};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -48,6 +48,8 @@ struct Params {
     demo: bool,
     calibrating: bool,
     calibration: f64,
+    /// Calibration came from the passive clock estimate, not a quartz run.
+    cal_auto: bool,
     cal_progress: String,
 }
 
@@ -60,6 +62,7 @@ impl Default for Params {
             demo: true,
             calibrating: false,
             calibration: 0.0,
+            cal_auto: false,
             cal_progress: String::new(),
         }
     }
@@ -78,10 +81,11 @@ struct RegulatorApp {
 }
 
 impl RegulatorApp {
-    fn new(ring: Option<Ring>) -> Self {
+    fn new(ring: Option<Ring>, clock_cal: Arc<Mutex<ClockCal>>) -> Self {
         let params = Arc::new(Mutex::new(Params::default()));
         let (tx, rx) = mpsc::channel::<Feed>();
         let params_arc = params.clone();
+        let clock_cal = clock_cal;
         std::thread::spawn(move || {
             let watch = SyntheticWatch {
                 bph: 28800,
@@ -141,6 +145,16 @@ impl RegulatorApp {
                     let _ = tx.send(Feed { result: None, trace: Vec::new(), cal: Some(view) });
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
+                }
+                // Passive clock calibration: apply once the sample-count
+                // regression has converged (unless a quartz calibration
+                // has set the value manually).
+                if let Some(err) = clock_cal.lock().unwrap_or_else(|e| e.into_inner()).converged(0.25) {
+                    let mut p = params_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    if p.cal_auto || p.calibration == 0.0 {
+                        p.calibration = err;
+                        p.cal_auto = true;
+                    }
                 }
                 drop(p);
                 let p2 = params_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -286,7 +300,8 @@ impl eframe::App for RegulatorApp {
                 strip_value(ui, "lift", &Some(format!("{:.0}°", p.lift_angle)));
                 strip_value(ui, "noise", &Some(if p.noise_suppressor { "on".to_string() } else { "off".to_string() }));
                 if p.calibration != 0.0 {
-                    strip_value(ui, "cal", &Some(format!("{:+.1} s/d", p.calibration)));
+                    let tag = if p.cal_auto { " auto" } else { "" };
+                    strip_value(ui, "cal", &Some(format!("{:+.1} s/d{tag}", p.calibration)));
                 }
                 if p.calibrating {
                     ui.label(
@@ -508,6 +523,8 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    let clock_cal: Arc<Mutex<ClockCal>> = Arc::new(Mutex::new(ClockCal::new(SAMPLE_RATE)));
+
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 520.0])
@@ -517,7 +534,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "regulator",
         native,
-        Box::new(move |_cc| Ok(Box::new(RegulatorApp::new(ring)))),
+        Box::new(move |_cc| Ok(Box::new(RegulatorApp::new(ring, clock_cal)))),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
