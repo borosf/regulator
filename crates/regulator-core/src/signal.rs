@@ -178,6 +178,22 @@ mod tests {
     }
 
     #[test]
+    fn detects_36000_bph() {
+        let watch = SyntheticWatch {
+            bph: 36000,
+            rate_sday: -8.0,
+            beat_error_ms: 0.3,
+            amplitude_deg: 290.0,
+            quartz: false,
+        };
+        let samples = watch.generate(SR, 6.0);
+        let an = Analyzer::new(SR);
+        let r = an.analyze(&samples).expect("analysis failed");
+        assert_eq!(r.bph, 36000, "detected bph: {}", r.bph);
+        assert!((r.rate_sday.unwrap() - (-8.0)).abs() < 3.0);
+    }
+
+    #[test]
     fn rejects_silence() {
         let an = Analyzer::new(SR);
         assert!(an.analyze(&vec![0.0; SR as usize * 2]).is_none());

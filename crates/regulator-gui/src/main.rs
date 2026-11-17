@@ -200,18 +200,94 @@ impl eframe::App for RegulatorApp {
             self.result = feed.result;
             self.trace = feed.trace;
         }
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = egui::Color32::from_rgb(14, 16, 18);
+        visuals.window_fill = egui::Color32::from_rgb(14, 16, 18);
+        ctx.set_visuals(visuals);
 
+        // Top: the primary readout. One number the watchmaker stares at,
+        // everything else is secondary.
+        egui::TopBottomPanel::top("readout").show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let rate = self.result.as_ref().and_then(|r| r.rate_sday);
+                let text = match rate {
+                    Some(v) => format!("{v:+.1}"),
+                    None => "---".into(),
+                };
+                let color = match rate {
+                    Some(v) if v.abs() < 5.0 => egui::Color32::from_rgb(120, 220, 120),
+                    Some(v) if v.abs() < 15.0 => egui::Color32::from_rgb(235, 200, 90),
+                    Some(_) => egui::Color32::from_rgb(235, 120, 100),
+                    None => egui::Color32::GRAY,
+                };
+                ui.label(
+                    egui::RichText::new(text)
+                        .monospace()
+                        .size(52.0)
+                        .strong()
+                        .color(color),
+                );
+                ui.label(egui::RichText::new("s/d").monospace().size(16.0).color(egui::Color32::GRAY));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let p = self.params.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}  {}",
+                            if p.demo { "demo" } else { "mic" },
+                            match p.bph {
+                                0 => "auto".to_string(),
+                                b => format!("{b} bph"),
+                            }
+                        ))
+                        .monospace()
+                        .size(13.0)
+                        .color(egui::Color32::GRAY),
+                    );
+                });
+            });
+            ui.add_space(2.0);
+        });
+
+        // Bottom: the secondary data strip.
+        egui::TopBottomPanel::bottom("strip").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.style_mut().override_font_id = Some(egui::FontId::monospace(15.0));
+                let p = self.params.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                strip_value(ui, "amp", &self.result.as_ref().and_then(|r| r.amplitude_deg).map(|v| format!("{v:.0}°")));
+                strip_value(ui, "be", &self.result.as_ref().and_then(|r| r.beat_error_ms).map(|v| format!("{v:+.2} ms")));
+                strip_value(ui, "lift", &Some(format!("{:.0}°", p.lift_angle)));
+                strip_value(ui, "noise", &Some(if p.noise_suppressor { "on".to_string() } else { "off".to_string() }));
+                if p.calibration != 0.0 {
+                    strip_value(ui, "cal", &Some(format!("{:+.1} s/d", p.calibration)));
+                }
+                if p.calibrating {
+                    ui.label(
+                        egui::RichText::new(format!("calibrating {}", p.cal_progress))
+                            .monospace()
+                            .size(13.0)
+                            .color(egui::Color32::from_rgb(235, 200, 90)),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+        });
+
+        // Right: controls, compact.
         egui::SidePanel::right("settings")
-            .min_width(220.0)
+            .min_width(190.0)
+            .resizable(false)
             .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
                 let mut p = self.params.lock().unwrap_or_else(|e| e.into_inner());
-                ui.heading("Settings");
-                ui.separator();
-                ui.label("Beat rate");
+                ui.label(egui::RichText::new("BEAT RATE").small().weak());
                 egui::ComboBox::from_id_salt("bph")
                     .selected_text(if p.bph == 0 { "auto".into() } else { p.bph.to_string() })
+                    .width(ui.available_width() - 12.0)
                     .show_ui(ui, |ui| {
-                        for b in [0u32, 18000, 21600, 25200, 28800, 36000] {
+                        for b in [0u32, 12000, 14400, 18000, 19800, 21600, 25200, 28800, 36000, 43200] {
                             ui.selectable_value(
                                 &mut p.bph,
                                 b,
@@ -219,115 +295,102 @@ impl eframe::App for RegulatorApp {
                             );
                         }
                     });
-                ui.add(
-                    egui::Slider::new(&mut p.lift_angle, 40.0..=60.0).text("lift angle (°)"),
-                );
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(format!("LIFT ANGLE  {:.0}°", p.lift_angle)).small().weak());
+                ui.add(egui::Slider::new(&mut p.lift_angle, 40.0..=60.0).show_value(false));
+                ui.add_space(6.0);
                 ui.checkbox(&mut p.noise_suppressor, "noise suppressor");
-                ui.separator();
-                if p.demo {
-                    ui.label("source: demo signal");
-                } else {
-                    ui.label("source: microphone");
-                }
-                ui.checkbox(&mut p.demo, "demo mode");
-                ui.separator();
+                ui.checkbox(&mut p.demo, "demo signal");
+                ui.add_space(10.0);
                 if p.calibrating {
-                    ui.label(format!("calibrating: {} (quartz watch, 1 tick/s; refits every second, stops when confident)", p.cal_progress));
                     if ui.button("stop calibration").clicked() {
                         p.calibrating = false;
                     }
-                } else {
-                    if ui.button("calibrate (quartz, exits early)").clicked() {
-                        p.calibrating = !p.demo; // calibration needs the mic
-                        p.cal_progress.clear();
-                    }
-                    if p.calibration != 0.0 {
-                        ui.label(format!("calibration: {:+.1} s/d", p.calibration));
-                    }
+                } else if ui.button("calibrate (quartz)").clicked() {
+                    p.calibrating = !p.demo;
+                    p.cal_progress.clear();
                 }
+                ui.add_space(10.0);
                 ui.separator();
-                ui.small("regulator — GPLv2\na fork of tg");
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("WAVEFORM").small().weak());
+                draw_waveform(ui, &self.result, 90.0);
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    ui.label(
+                        egui::RichText::new("regulator — GPLv2")
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(90)),
+                    );
+                });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                big_metric(
-                    ui,
-                    "Rate",
-                    &self.result.as_ref().and_then(|r| r.rate_sday),
-                    "s/day",
-                    1,
-                );
-                big_metric(
-                    ui,
-                    "Amplitude",
-                    &self.result.as_ref().and_then(|r| r.amplitude_deg),
-                    "°",
-                    0,
-                );
-                big_metric(
-                    ui,
-                    "Beat error",
-                    &self.result.as_ref().and_then(|r| r.beat_error_ms),
-                    "ms",
-                    2,
-                );
+        // Center: the strip chart. Time flows downward, newest ticks at the
+        // bottom; horizontal axis is the phase error against the beat grid.
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(egui::Color32::from_rgb(10, 11, 12)))
+            .show(ctx, |ui| {
+                draw_trace(ui, &self.trace);
             });
-            ui.separator();
-            let wave_h = ui.available_size().y * 0.42;
-            draw_waveform(ui, &self.result, wave_h);
-            ui.separator();
-            ui.label("Trace");
-            draw_trace(ui, &self.trace);
-        });
 
         ctx.request_repaint_after(Duration::from_millis(200));
     }
 }
 
-/// The tick-event trace: each event plotted at its phase error over time.
-/// A rate error shows as drifting diagonal bands, beat error as two
-/// separated bands, noise as scatter - the classic timing-machine display.
-fn draw_trace(ui: &mut egui::Ui, trace: &[TracePoint]) {
-    let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
-    painter.rect_filled(resp.rect, 4.0, egui::Color32::from_gray(16));
-    if trace.is_empty() {
-        return;
-    }
-    let rect = resp.rect;
-    let t_end = trace.last().map(|p| p.t).unwrap_or(0.0);
-    let t_start = (t_end - 60.0).max(0.0);
-    // Vertical scale: half the beat period, so tic and toc bands both fit.
-    let half_ms = 1000.0 * 3600.0 / 14400.0;
-    let to_x = |t: f64| rect.left() + (((t - t_start) / 60.0).clamp(0.0, 1.0) * rect.width() as f64) as f32;
-    let to_y = |ms: f64| {
-        let k = (ms / half_ms).clamp(-1.0, 1.0) as f32;
-        rect.center().y - k * (rect.height() / 2.0 - 3.0)
-    };
-    // Center line: the nominal beat grid.
-    painter.line_segment(
-        [rect.left_top() + egui::vec2(0.0, rect.height() / 2.0), rect.right_top() + egui::vec2(0.0, rect.height() / 2.0)],
-        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(48)),
-    );
-    for p in trace.iter().filter(|p| p.t >= t_start) {
-        let color = if p.tic {
-            egui::Color32::LIGHT_GREEN
-        } else {
-            egui::Color32::from_rgb(255, 120, 255)
-        };
-        painter.circle_filled(egui::pos2(to_x(p.t), to_y(p.phase_ms)), 1.5_f32, color);
-    }
+fn strip_value(ui: &mut egui::Ui, name: &str, value: &Option<String>) {
+    let v = value.clone().unwrap_or_else(|| "---".into());
+    ui.label(egui::RichText::new(name).size(11.0).color(egui::Color32::from_gray(110)));
+    ui.label(egui::RichText::new(v).size(15.0).strong());
+    ui.add_space(12.0);
 }
 
-fn big_metric(ui: &mut egui::Ui, name: &str, value: &Option<f64>, unit: &str, decimals: usize) {
-    let text = match value {
-        Some(v) => format!("{:+.width$}", v, width = decimals),
-        None => "---".into(),
+/// The strip chart: each tick event is a short dash at its phase error;
+/// time scrolls downward. Rate error drifts the dashes sideways, beat
+/// error splits tic/toc into two columns, noise widens the scatter.
+fn draw_trace(ui: &mut egui::Ui, trace: &[TracePoint]) {
+    let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
+    let rect = resp.rect;
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(10, 11, 12));
+    // Phase-error window: +/- 25 ms, ticks wrap into it.
+    const WINDOW_MS: f64 = 25.0;
+    let cx = rect.center().x;
+    let half_w = rect.width() / 2.0 - 8.0;
+    let to_x = |ms: f64| {
+        let wrapped = ((ms + WINDOW_MS) % (2.0 * WINDOW_MS) + 2.0 * WINDOW_MS) % (2.0 * WINDOW_MS) - WINDOW_MS;
+        cx + (wrapped / WINDOW_MS * half_w as f64) as f32
     };
-    ui.vertical(|ui| {
-        ui.heading(egui::RichText::new(text).size(34.0));
-        ui.label(format!("{name} ({unit})"));
-    });
+    // Grid: center line plus 10 ms steps.
+    for ms in [-20.0, -10.0, 0.0, 10.0, 20.0] {
+        let x = to_x(ms);
+        let color = if ms == 0.0 {
+            egui::Color32::from_gray(52)
+        } else {
+            egui::Color32::from_gray(28)
+        };
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(1.0_f32, color),
+        );
+    }
+    let bottom = rect.bottom();
+    let h = rect.height();
+    for p in trace {
+        let age = trace.last().map(|q| q.t).unwrap_or(0.0) - p.t;
+        if age > 60.0 {
+            continue;
+        }
+        let y = bottom - (age / 60.0 * h as f64) as f32;
+        let x = to_x(p.phase_ms);
+        let color = if p.tic {
+            egui::Color32::from_rgb(140, 230, 140)
+        } else {
+            egui::Color32::from_rgb(240, 140, 240)
+        };
+        painter.line_segment(
+            [egui::pos2(x - 1.5, y), egui::pos2(x + 1.5, y)],
+            egui::Stroke::new(1.6_f32, color),
+        );
+    }
 }
 
 fn draw_waveform(ui: &mut egui::Ui, result: &Option<TimingResult>, height: f32) {
