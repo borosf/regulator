@@ -1,0 +1,14 @@
+[package]
+name = "regulator-core"
+description = "Watch timing DSP: tick detection, rate, amplitude and beat error"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustfft = { workspace = true }
+
+[dev-dependencies]
+hound = "3"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "isomp4", "aac", "pcm"] }

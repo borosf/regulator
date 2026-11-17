@@ -1,5 +1,6 @@
 .*
 !.gitignore
+!.github
 !.travis.yml
 !.valgrind.supp
 
@@ -53,3 +54,6 @@ Makefile.in
 # build directories
 /deb
 /msi
+
+# Rust
+/target
