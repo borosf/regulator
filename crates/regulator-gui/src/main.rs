@@ -53,6 +53,65 @@ struct Params {
     /// Live clock-calibration estimate and uncertainty while converging.
     cal_live: Option<(f64, f64)>,
     cal_progress: String,
+    /// Settings changed since the last save.
+    dirty: bool,
+}
+
+impl Params {
+    fn config_path() -> std::path::PathBuf {
+        let dir = if let Ok(a) = std::env::var("APPDATA") {
+            std::path::PathBuf::from(a).join("regulator")
+        } else if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
+            std::path::PathBuf::from(x).join("regulator")
+        } else if let Ok(h) = std::env::var("HOME") {
+            std::path::PathBuf::from(h).join(".config").join("regulator")
+        } else {
+            std::path::PathBuf::from(".")
+        };
+        std::fs::create_dir_all(&dir).ok();
+        dir.join("config.txt")
+    }
+
+    fn load() -> Self {
+        let mut p = Params::default();
+        if let Ok(text) = std::fs::read_to_string(Self::config_path()) {
+            for line in text.lines() {
+                let Some((k, v)) = line.split_once('=') else { continue };
+                match k.trim() {
+                    "bph" => {
+                        if let Ok(n) = v.trim().parse() {
+                            p.bph = n;
+                        }
+                    }
+                    "lift_angle" => {
+                        if let Ok(n) = v.trim().parse() {
+                            p.lift_angle = n;
+                        }
+                    }
+                    "calibration" => {
+                        if let Ok(n) = v.trim().parse() {
+                            p.calibration = n;
+                            p.cal_auto = true;
+                        }
+                    }
+                    "noise_suppressor" => p.noise_suppressor = v.trim() == "true",
+                    _ => {}
+                }
+            }
+        }
+        p
+    }
+
+    fn save(&self) {
+        let text = format!(
+            "bph={}\nlift_angle={:.1}\ncalibration={:.3}\nnoise_suppressor={}\n",
+            self.bph,
+            self.lift_angle,
+            self.calibration,
+            self.noise_suppressor
+        );
+        let _ = std::fs::write(Self::config_path(), text);
+    }
 }
 
 impl Default for Params {
@@ -67,6 +126,7 @@ impl Default for Params {
             cal_auto: false,
             cal_live: None,
             cal_progress: String::new(),
+            dirty: false,
         }
     }
 }
@@ -102,7 +162,7 @@ struct RegulatorApp {
 
 impl RegulatorApp {
     fn new(ring: Option<Ring>, clock_cal: Arc<Mutex<ClockCal>>) -> Self {
-        let params = Arc::new(Mutex::new(Params::default()));
+        let params = Arc::new(Mutex::new(Params::load()));
         let (tx, rx) = mpsc::channel::<Feed>();
         let params_arc = params.clone();
         let clock_cal = clock_cal;
@@ -140,6 +200,8 @@ impl RegulatorApp {
                                 CalStatus::Done(cal) => {
                                     p.calibration = cal;
                                     p.calibrating = false;
+                                    p.cal_auto = true;
+                                    p.dirty = true;
                                     p.cal_progress = format!("{cal:+.1} s/d");
                                 }
                                 CalStatus::Failed => {
@@ -181,6 +243,10 @@ impl RegulatorApp {
                     // so it is never auto-applied. The quartz calibration
                     // is the authoritative correction.
                     p.cal_live = Some((err, unc));
+                }
+                if p.dirty {
+                    p.save();
+                    p.dirty = false;
                 }
                 drop(p);
                 let p2 = params_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -379,6 +445,7 @@ impl eframe::App for RegulatorApp {
                 ui.add_space(6.0);
                 ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
                 let mut p = self.params.lock().unwrap_or_else(|e| e.into_inner());
+                let before = (p.bph, p.lift_angle, p.calibration, p.noise_suppressor, p.demo);
                 ui.label(egui::RichText::new("BEAT RATE").small().weak());
                 egui::ComboBox::from_id_salt("bph")
                     .selected_text(if p.bph == 0 { "auto".into() } else { p.bph.to_string() })
@@ -403,6 +470,13 @@ impl eframe::App for RegulatorApp {
                 ui.add_space(6.0);
                 ui.checkbox(&mut p.noise_suppressor, "noise suppressor");
                 ui.checkbox(&mut p.demo, "demo signal");
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("CALIBRATION s/d").small().weak());
+                ui.add(
+                    egui::DragValue::new(&mut p.calibration)
+                        .speed(0.1)
+                        .range(-100.0..=100.0),
+                );
                 ui.add_space(10.0);
                 if p.calibrating {
                     if ui.button("stop calibration").clicked() {
@@ -413,13 +487,11 @@ impl eframe::App for RegulatorApp {
                     p.calibrating = true;
                     p.cal_progress.clear();
                 }
-                if let Some((err, unc)) = p.cal_live {
-                    if unc < 2.0 && ui.button(format!("use clock est {err:+.1}")).clicked() {
-                        p.calibration = err;
-                        p.cal_auto = true;
-                    }
-                }
                 ui.add_space(10.0);
+                let after = (p.bph, p.lift_angle, p.calibration, p.noise_suppressor, p.demo);
+                if after != before {
+                    p.dirty = true;
+                }
                 ui.separator();
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("WAVEFORM").small().weak());

@@ -147,7 +147,9 @@ impl CalibrationState {
     /// sound card's apparent rate error.
     fn fit(points: &[(f64, f64)]) -> Result<f64, ()> {
         let (cal, delta) = Self::fit_with_delta(points)?;
-        if delta >= 0.1 {
+        // tg gates at 0.1 s/d; 0.2 is still far finer than the rate readout
+        // and roughly halves the convergence time.
+        if delta >= 0.2 {
             return Err(());
         }
         Ok(cal)
