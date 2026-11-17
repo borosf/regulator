@@ -134,26 +134,39 @@ impl Analyzer {
             _ => None,
         };
 
-        // Locate individual tick events by extrapolating the tic/toc peaks
-        // through the block at the detected period (a light-weight version
-        // of tg's locate_events, which cross-correlates a template).
+        // Locate individual tick events by measuring each arrival: search
+        // the prepared signal around each expected position (extrapolated
+        // from the folded-waveform peaks at the detected period) for the
+        // local maximum. The deviation of the measured peak from the
+        // expectation is the per-tick phase error that draws the trace.
         let mut events = Vec::new();
         if let (Some(tic), Some(toc)) = (tic, toc) {
-            let wf_size = waveform.len().max(1);
+            let search = (period / 16.0).max(4.0) as usize;
             let tic0 = (tic + phase_shift) as f64;
             let toc0 = (toc + phase_shift) as f64;
             let cycles = (n as f64 / period).ceil() as usize + 1;
             for k in 0..cycles {
-                let t = tic0 + k as f64 * period;
-                if t >= 0.0 && t < n as f64 {
-                    events.push((t, true));
-                }
-                let t = toc0 + k as f64 * period;
-                if t >= 0.0 && t < n as f64 {
-                    events.push((t, false));
+                for (base, is_tic) in [(tic0, true), (toc0, false)] {
+                    let expected = base + k as f64 * period;
+                    if expected < -(search as f64) || expected > n as f64 {
+                        continue;
+                    }
+                    let a = (expected as isize - search as isize).max(0) as usize;
+                    let b = ((expected as usize) + search).min(n - 1);
+                    if b <= a {
+                        continue;
+                    }
+                    // Only accept a peak that actually rises above the
+                    // local noise floor; otherwise the tick was missed.
+                    let (peak, _) = vmax(&s, a, b + 1);
+                    let med = median(&mut s[a..=b].to_vec());
+                    if peak <= 0.0 || peak < 2.0 * med {
+                        continue;
+                    }
+                    let (_, i_max) = vmax(&s, a, b + 1);
+                    events.push((i_max as f64, is_tic));
                 }
             }
-            let _ = wf_size;
         }
 
         let detected_bph = 2.0 * 3600.0 * sr as f64 / period;

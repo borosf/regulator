@@ -50,6 +50,8 @@ struct Params {
     calibration: f64,
     /// Calibration came from the passive clock estimate, not a quartz run.
     cal_auto: bool,
+    /// Live clock-calibration estimate and uncertainty while converging.
+    cal_live: Option<(f64, f64)>,
     cal_progress: String,
 }
 
@@ -63,13 +65,31 @@ impl Default for Params {
             calibrating: false,
             calibration: 0.0,
             cal_auto: false,
+            cal_live: None,
             cal_progress: String::new(),
         }
     }
 }
 
-/// Shared ring buffer of live microphone samples (if capture is available).
-type Ring = Arc<Mutex<Vec<f32>>>;
+/// Shared ring buffer of live microphone samples (if capture is available),
+/// with a monotonic total so window start times never go backwards.
+struct MicBuf {
+    data: Vec<f32>,
+    total: u64,
+}
+
+#[cfg(feature = "audio")]
+impl MicBuf {
+    fn push(&mut self, s: f32, cap: usize) {
+        self.data.push(s);
+        self.total += 1;
+        if self.data.len() > cap {
+            self.data.drain(..cap / 2);
+        }
+    }
+}
+
+type Ring = Arc<Mutex<MicBuf>>;
 
 struct RegulatorApp {
     result: Option<TimingResult>,
@@ -98,6 +118,7 @@ impl RegulatorApp {
             let block = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize;
             let mut start = 0usize;
             let mut win_start_s = 0.0f64;
+            let mut demo_total_s = 0.0f64;
             let mut last_event_s = 0.0f64;
             let mut trace: Vec<TracePoint> = Vec::new();
             let mut ts: u64 = 0;
@@ -109,12 +130,12 @@ impl RegulatorApp {
                 if p.calibrating {
                     if let Some(ring) = &ring {
                         let buf = ring.lock().unwrap_or_else(|e| e.into_inner());
-                        ts += buf.len().saturating_sub(last_len) as u64;
-                        last_len = buf.len();
-                        if buf.len() >= block && cal_cooldown == 0 {
+                        ts += buf.total.saturating_sub(last_len as u64) as u64;
+                        last_len = buf.total as usize;
+                        if buf.data.len() >= block && cal_cooldown == 0 {
                             let cal_an = Analyzer::for_calibration(SAMPLE_RATE);
-                            let window_start_ts = ts.saturating_sub(buf.len() as u64);
-                            match cal_state.add_block(&cal_an, &buf[buf.len() - block..], window_start_ts) {
+                            let window_start_ts = ts.saturating_sub(buf.data.len() as u64);
+                            match cal_state.add_block(&cal_an, &buf.data[buf.data.len() - block..], window_start_ts) {
                                 CalStatus::Done(cal) => {
                                     p.calibration = cal;
                                     p.calibrating = false;
@@ -149,9 +170,11 @@ impl RegulatorApp {
                 // Passive clock calibration: apply once the sample-count
                 // regression has converged (unless a quartz calibration
                 // has set the value manually).
-                if let Some(err) = clock_cal.lock().unwrap_or_else(|e| e.into_inner()).converged(0.25) {
+                let cc_est = clock_cal.lock().unwrap_or_else(|e| e.into_inner()).estimate();
+                if let Some((err, unc)) = cc_est {
                     let mut p = params_arc.lock().unwrap_or_else(|e| e.into_inner());
-                    if p.cal_auto || p.calibration == 0.0 {
+                    p.cal_live = Some((err, unc));
+                    if unc <= 0.25 && (p.cal_auto || p.calibration == 0.0) {
                         p.calibration = err;
                         p.cal_auto = true;
                     }
@@ -166,7 +189,8 @@ impl RegulatorApp {
                 let res = if p2.demo {
                     let end = (start + block).min(demo_samples.len());
                     let r = analyzer.analyze(&demo_samples[start..end]);
-                    win_start_s = start as f64 / SAMPLE_RATE as f64;
+                    win_start_s = demo_total_s;
+                    demo_total_s += (end - start) as f64 / SAMPLE_RATE as f64;
                     if end == demo_samples.len() {
                         start = 0;
                     } else {
@@ -175,9 +199,9 @@ impl RegulatorApp {
                     r
                 } else if let Some(ring) = &ring {
                     let buf = ring.lock().unwrap_or_else(|e| e.into_inner());
-                    if buf.len() >= block {
-                        win_start_s = (buf.len() - block) as f64 / SAMPLE_RATE as f64;
-                        analyzer.analyze(&buf[buf.len() - block..])
+                    if buf.data.len() >= block {
+                        win_start_s = (buf.total - block as u64) as f64 / SAMPLE_RATE as f64;
+                        analyzer.analyze(&buf.data[buf.data.len() - block..])
                     } else {
                         None
                     }
@@ -302,6 +326,14 @@ impl eframe::App for RegulatorApp {
                 if p.calibration != 0.0 {
                     let tag = if p.cal_auto { " auto" } else { "" };
                     strip_value(ui, "cal", &Some(format!("{:+.1} s/d{tag}", p.calibration)));
+                } else if let Some((err, unc)) = p.cal_live {
+                    ui.label(
+                        egui::RichText::new(format!("cal {err:+.1} ±{unc:.1}"))
+                            .monospace()
+                            .size(14.0)
+                            .color(egui::Color32::from_rgb(235, 200, 90)),
+                    );
+                    ui.add_space(12.0);
                 }
                 if p.calibrating {
                     ui.label(
@@ -489,23 +521,29 @@ fn draw_waveform(ui: &mut egui::Ui, result: &Option<TimingResult>, height: f32) 
 }
 
 fn main() -> anyhow::Result<()> {
+    let clock_cal: Arc<Mutex<ClockCal>> = Arc::new(Mutex::new(ClockCal::new(SAMPLE_RATE)));
+
     // Live capture (if built with the audio feature); a relay thread moves
-    // samples into a shared ring buffer the worker reads.
+    // samples into a shared ring buffer the worker reads, feeding the
+    // clock calibration as it goes.
     let ring: Option<Ring> = {
         #[cfg(feature = "audio")]
         {
             let (tx, rx) = mpsc::channel::<f32>();
             match audio::spawn_capture(tx) {
                 Ok(()) => {
-                    let ring: Ring = Arc::new(Mutex::new(Vec::new()));
+                    let ring: Ring = Arc::new(Mutex::new(MicBuf { data: Vec::new(), total: 0 }));
                     let r = ring.clone();
+                    let cc = clock_cal.clone();
                     std::thread::spawn(move || {
-                        let block = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize;
+                        let cap = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize * 2;
+                        let mut batch = 0usize;
                         while let Ok(s) = rx.recv() {
-                            let mut buf = r.lock().unwrap_or_else(|e| e.into_inner());
-                            buf.push(s);
-                            if buf.len() > block * 2 {
-                                buf.drain(..block);
+                            r.lock().unwrap_or_else(|e| e.into_inner()).push(s, cap);
+                            batch += 1;
+                            if batch >= 2048 {
+                                cc.lock().unwrap_or_else(|e| e.into_inner()).add(batch);
+                                batch = 0;
                             }
                         }
                     });
@@ -522,8 +560,6 @@ fn main() -> anyhow::Result<()> {
             None
         }
     };
-
-    let clock_cal: Arc<Mutex<ClockCal>> = Arc::new(Mutex::new(ClockCal::new(SAMPLE_RATE)));
 
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
