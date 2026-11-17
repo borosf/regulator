@@ -48,10 +48,37 @@ impl ClockCal {
     /// (separated for testability).
     pub fn add_at(&mut self, n: usize, t: f64) {
         self.total += n as u64;
-        if t - self.last_point >= 0.25 {
-            self.last_point = t;
-            self.points.push((t, self.total as f64));
+        if t - self.last_point < 0.25 {
+            return;
         }
+        // Step detection: if the new point lands far off the current trend,
+        // the system clock jumped (NTP step) - the old points are on a
+        // different time base, so restart the series from here.
+        if self.points.len() >= 16 {
+            let (t_av, n_av) = self.means();
+            let (mut stt, mut stn) = (0.0, 0.0);
+            for &(pt, c) in &self.points {
+                stt += (pt - t_av) * (pt - t_av);
+                stn += (pt - t_av) * (c - n_av);
+            }
+            if stt > 0.0 {
+                let slope = stn / stt;
+                let predicted = n_av + slope * (t - t_av);
+                if (self.total as f64 - predicted).abs() > 0.05 * slope {
+                    self.points.clear();
+                }
+            }
+        }
+        self.last_point = t;
+        self.points.push((t, self.total as f64));
+    }
+
+    fn means(&self) -> (f64, f64) {
+        let n = self.points.len() as f64;
+        (
+            self.points.iter().map(|p| p.0).sum::<f64>() / n,
+            self.points.iter().map(|p| p.1).sum::<f64>() / n,
+        )
     }
 
     /// The sound-card rate error in s/day, with its uncertainty in s/day,
@@ -119,6 +146,23 @@ mod tests {
         assert!(unc < 1.0, "unc: {unc}");
         let done = cal.converged(1.0).expect("converged");
         assert!((done - 12.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn survives_clock_step() {
+        let mut cal = ClockCal::new(44100);
+        let rate = 44100.0_f64;
+        for i in 0..400 {
+            cal.add_at((rate * 0.25) as usize, (i + 1) as f64 * 0.25);
+        }
+        // The system clock steps by 1.4 s: subsequent timestamps jump.
+        let step = 1.4;
+        for i in 400..800 {
+            cal.add_at((rate * 0.25) as usize, (i + 1) as f64 * 0.25 + step);
+        }
+        let (err, unc) = cal.estimate().expect("estimate after step");
+        assert!(err.abs() < 1.0, "err: {err}");
+        assert!(unc < 1.0, "unc: {unc}");
     }
 
     #[test]
