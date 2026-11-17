@@ -9,6 +9,7 @@ fn main() {
         rate_sday: 12.0,
         beat_error_ms: 0.0,
         amplitude_deg: 270.0,
+        quartz: false,
     };
     let samples = watch.generate(sr, 4.0);
     let an = Analyzer::new(sr);

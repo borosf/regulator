@@ -13,6 +13,9 @@ pub struct SyntheticWatch {
     pub beat_error_ms: f64,
     /// Balance amplitude in degrees (affects pulse width).
     pub amplitude_deg: f64,
+    /// Quartz mode: a sharp click once per second (no escapement build-up),
+    /// for sound-card calibration against a quartz watch.
+    pub quartz: bool,
 }
 
 impl SyntheticWatch {
@@ -49,13 +52,26 @@ impl SyntheticWatch {
                     / std::f64::consts::PI
                     * sr) as usize;
                 let width = width.min(burst_len);
-                for i in 0..width {
+                // Real escapement sounds build up before the main impulse:
+                // a rising pre-hump about one pulse width before the tick,
+                // then the sharp attack at the tick itself. tg's amplitude
+                // scan measures the distance from the pre-hump's local
+                // maximum to the tick, which tracks `width`.
+                if !self.quartz {
+                    for i in 0..width {
+                        let tt = i as f64 / sr;
+                        let bump = (std::f64::consts::PI * i as f64 / width as f64).sin();
+                        let env = bump * bump * 0.35;
+                        let carrier = (2.0 * std::f64::consts::PI * 3500.0 * tt).sin();
+                        let idx = base as isize + i as isize - 3 * width as isize / 2;
+                        if idx >= 0 && (idx as usize) < n {
+                            out[idx as usize] += (env * carrier) as f32;
+                        }
+                    }
+                }
+                for i in 0..width / 3 {
                     let tt = i as f64 / sr;
-                    // Sharp attack at the unlock, exponential decay: like a
-                    // real impulse, the sound starts at the tick and rings
-                    // down. The analyzer measures the duration above 20% of
-                    // the peak, which tracks `width`.
-                    let env = (-1.6 * i as f64 / width as f64).exp();
+                    let env = (-4.0 * i as f64 / (width / 3) as f64).exp();
                     let carrier = (2.0 * std::f64::consts::PI * 3500.0 * tt).sin();
                     let idx = base as isize + i as isize;
                     if idx >= 0 && (idx as usize) < n {
@@ -96,6 +112,7 @@ mod tests {
             rate_sday: 12.0,
             beat_error_ms: 0.4,
             amplitude_deg: 270.0,
+            quartz: false,
         };
         let samples = watch.generate(SR, 4.0);
         let mut an = Analyzer::new(SR);
@@ -111,6 +128,7 @@ mod tests {
             rate_sday: -5.0,
             beat_error_ms: 0.0,
             amplitude_deg: 250.0,
+            quartz: false,
         };
         let samples = watch.generate(SR, 6.0);
         let an = Analyzer::new(SR);
@@ -129,6 +147,7 @@ mod tests {
             rate_sday: 0.0,
             beat_error_ms: 1.2,
             amplitude_deg: 260.0,
+            quartz: false,
         };
         let samples = watch.generate(SR, 4.0);
         let mut an = Analyzer::new(SR);
@@ -148,6 +167,7 @@ mod tests {
             rate_sday: 0.0,
             beat_error_ms: 0.0,
             amplitude_deg: 270.0,
+            quartz: false,
         };
         let samples = watch.generate(SR, 4.0);
         let mut an = Analyzer::new(SR);

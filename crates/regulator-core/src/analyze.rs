@@ -84,6 +84,7 @@ pub struct Analyzer {
     /// from the measured rate.
     pub calibration: f64,
     lpf: Biquad,
+    hpf: Biquad,
     fft: RefCell<FftCache>,
     last_sigma: Cell<f64>,
 }
@@ -99,6 +100,7 @@ impl Analyzer {
             noise_suppressor: true,
             calibration: 0.0,
             lpf: Biquad::low_pass(crate::FILTER_CUTOFF / sample_rate as f64),
+            hpf: Biquad::high_pass(crate::FILTER_CUTOFF / sample_rate as f64),
             fft: RefCell::new(FftCache::new()),
             last_sigma: Cell::new(0.0),
         }
@@ -163,6 +165,7 @@ impl Analyzer {
     pub(crate) fn prepare_data(&self, s: &mut Vec<f32>) {
         let n = s.len();
         let sr = self.sample_rate as usize;
+        self.hpf.run(s);
         if self.noise_suppressor {
             Self::noise_suppressor(s, sr);
         }
@@ -502,11 +505,12 @@ impl Analyzer {
         Some((Some(be * 1000.0 / sr as f64), tic, toc))
     }
 
-    /// Amplitude from the tic/toc pulse widths. tg measures the distance
-    /// between an escalating threshold crossing and the smoothed peak, which
-    /// is fragile; regulator instead measures the duration the smoothed
-    /// pulse stays above 20% of its peak, which is the impulse duration the
-    /// amplitude formula wants: A/la = 0.5 / sin(pi * pulse / period).
+    /// Amplitude from the tic/toc pulse widths, tg's algorithm: scan the
+    /// eighth before each tick for a threshold crossing, follow the
+    /// increasing run to its local maximum, and take the distance from
+    /// that local max to the tick as the pulse width. Real escapement
+    /// sounds have a build-up before the main impulse, so this distance
+    /// tracks the impulse duration. A/la = 0.5 / sin(pi * pulse / period).
     fn compute_amplitude(&self, wf: &[f32], period: f64, tic: usize, toc: usize) -> Option<f64> {
         let sr = self.sample_rate as usize;
         let wf_size = wf.len();
@@ -518,48 +522,72 @@ impl Analyzer {
             return None;
         }
         let wlen = smooth.len();
-        let max_walk = (period / 8.0) as usize;
-
-        let mut amps = [0.0f64; 2];
-        for (k, &t) in [tic, toc].iter().enumerate() {
-            if t >= wlen {
-                return None;
+        let eighth = (period / 8.0) as usize;
+        if eighth == 0 || tic >= wlen || toc >= wlen {
+            return None;
+        }
+        let glob_max = smooth.iter().cloned().fold(0f32, f32::max);
+        if glob_max <= 0.0 {
+            return None;
+        }
+        // Noise level in the eighths following each tick.
+        let mut quiet = 0.0f32;
+        for &t in &[tic, toc] {
+            let mut j = ((t as f64 + period / 8.0) % wlen as f64) as usize;
+            for _ in 0..eighth {
+                if smooth[j] > quiet {
+                    quiet = smooth[j];
+                }
+                j = (j + 1) % wlen;
             }
-            let peak = smooth[t];
-            if peak <= 0.0 {
-                return None;
-            }
-            let th = 0.2 * peak;
-            let mut lo = t;
-            for _ in 0..max_walk {
-                if smooth[(lo + wlen - 1) % wlen] <= th {
+        }
+        let mut threshold = (0.01 * glob_max).max(1.4 * quiet);
+        while threshold < 0.2 * glob_max {
+            let mut pulses = [0.0f64; 2];
+            let mut ok = true;
+            for (k, &t) in [toc, tic].iter().enumerate() {
+                let mut j = ((t as f64 + 7.0 * period / 8.0) % wlen as f64) as usize;
+                let mut i = 0usize;
+                while i < eighth {
+                    if smooth[j] > threshold {
+                        break;
+                    }
+                    i += 1;
+                    j = (j + 1) % wlen;
+                }
+                let mut max = 0.0f32;
+                while i < eighth {
+                    let x = smooth[j];
+                    if x > max {
+                        max = x;
+                    } else {
+                        break;
+                    }
+                    i += 1;
+                    j = (j + 1) % wlen;
+                }
+                if i < eighth {
+                    pulses[k] = period / 8.0 - i as f64 - 1.0;
+                } else {
+                    ok = false;
                     break;
                 }
-                lo = (lo + wlen - 1) % wlen;
             }
-            let mut hi = t;
-            for _ in 0..max_walk {
-                if smooth[hi % wlen] <= th {
-                    break;
+            if ok {
+                let tic_amp_abs = 0.5 / (std::f64::consts::PI * pulses[0] / period).sin();
+                let toc_amp_abs = 0.5 / (std::f64::consts::PI * pulses[1] / period).sin();
+                let tic_amp = self.lift_angle * tic_amp_abs;
+                let toc_amp = self.lift_angle * toc_amp_abs;
+                if (135.0..360.0).contains(&tic_amp)
+                    && (135.0..360.0).contains(&toc_amp)
+                    && (tic_amp - toc_amp).abs() < 60.0
+                {
+                    return Some(self.lift_angle * (tic_amp_abs + toc_amp_abs) / 2.0);
                 }
-                hi = (hi + 1) % wlen;
             }
-            let span = (hi + wlen - lo) % wlen;
-            if span == 0 || span >= max_walk {
-                return None;
-            }
-            amps[k] = 0.5 / (std::f64::consts::PI * span as f64 / period).sin();
+            threshold *= 1.4;
         }
-        let tic_amp = self.lift_angle * amps[0];
-        let toc_amp = self.lift_angle * amps[1];
-        if (135.0..360.0).contains(&tic_amp)
-            && (135.0..360.0).contains(&toc_amp)
-            && (tic_amp - toc_amp).abs() < 60.0
-        {
-            Some(self.lift_angle * (amps[0] + amps[1]) / 2.0)
-        } else {
-            None
-        }
+        None
     }
 
     /// Exponential-decay peak smoother, ported from tg's smooth().

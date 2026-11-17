@@ -186,6 +186,7 @@ mod tests {
             rate_sday: 15.0,
             beat_error_ms: 0.0,
             amplitude_deg: 250.0,
+            quartz: true,
         };
         let samples = quartz.generate(SR, 44.0);
         let an = Analyzer::for_calibration(SR);

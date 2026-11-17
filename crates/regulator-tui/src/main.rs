@@ -66,6 +66,7 @@ fn spawn_demo_worker(tx: mpsc::Sender<Option<TimingResult>>, settings: Arc<Mutex
             rate_sday: 9.0,
             beat_error_ms: 0.6,
             amplitude_deg: 275.0,
+            quartz: false,
         };
         let samples = watch.generate(SAMPLE_RATE, 60.0);
         let mut start = 0usize;

@@ -59,6 +59,7 @@ impl RegulatorApp {
                 rate_sday: 9.0,
                 beat_error_ms: 0.6,
                 amplitude_deg: 275.0,
+                quartz: false,
             };
             let demo_samples = watch.generate(SAMPLE_RATE, 120.0);
             let block = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize;
