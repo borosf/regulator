@@ -185,22 +185,26 @@ impl RegulatorApp {
             let mut last_v2 = None;
             // Absolute sample position of the demo signal (it loops).
             let mut demo_pos: u64 = 0;
-            let mut ts: u64 = 0;
-            let mut last_len = 0usize;
             let mut cal_state = CalibrationState::new();
             let mut cal_cooldown = 0u32;
+            let mut cal_fed_until: u64 = 0;
             let mut analyzer = Analyzer::new(SAMPLE_RATE);
             loop {
                 let mut p = params_arc.lock().unwrap_or_else(|e| e.into_inner());
                 if p.calibrating {
                     if let Some(ring) = &ring {
                         let buf = ring.lock().unwrap_or_else(|e| e.into_inner());
-                        ts += buf.total.saturating_sub(last_len as u64) as u64;
-                        last_len = buf.total as usize;
-                        if buf.data.len() >= block && cal_cooldown == 0 {
+                        // Feed calibration only non-overlapping windows:
+                        // overlapping windows produce correlated (time,
+                        // phase) samples, which inflate the fit's
+                        // confidence and let it exit on a bias.
+                        let start_u64 = buf.total.saturating_sub(block as u64);
+                        if buf.data.len() >= block && start_u64 >= cal_fed_until {
                             let cal_an = Analyzer::for_calibration(SAMPLE_RATE);
-                            let window_start_ts = ts.saturating_sub(buf.data.len() as u64);
-                            match cal_state.add_block(&cal_an, &buf.data[buf.data.len() - block..], window_start_ts) {
+                            let w = buf.data[buf.data.len() - block..].to_vec();
+                            let window_start_ts = start_u64;
+                            cal_fed_until = start_u64 + w.len() as u64;
+                            match cal_state.add_block(&cal_an, &w, window_start_ts) {
                                 CalStatus::Done(cal) => {
                                     p.calibration = cal;
                                     p.calibrating = false;
@@ -293,12 +297,24 @@ impl RegulatorApp {
                     }
                 }
                 let use_v2_events = tracker.locked();
+                // The rate estimate of record: the v2 tracker accumulates
+                // per-block run regressions for the whole session (an
+                // estimator, not one 4-second block), converging with an
+                // honest standard error; the v1 per-block estimate only
+                // stands in until the tracker locks.
+                let session_rate = tracker.rate();
                 let combined: Option<TimingResult> = match &res {
-                    Some(r) => Some(r.clone()),
+                    Some(r) => {
+                        let mut c = r.clone();
+                        if let Some(sr_) = session_rate {
+                            c.rate_sday = Some(sr_);
+                        }
+                        Some(c)
+                    }
                     None => match &last_v2 {
                         Some(r2) if r2.locked => Some(TimingResult {
                             period: r2.period,
-                            rate_sday: r2.rate_sday,
+                            rate_sday: session_rate.or(r2.rate_sday),
                             beat_error_ms: None,
                             amplitude_deg: None,
                             sigma: 0.0,

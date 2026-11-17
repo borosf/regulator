@@ -92,7 +92,7 @@ impl CalibrationState {
             Some(p) => p,
             None => return CalStatus::Missed,
         };
-        let (wf, phase, _) = an.compute_waveform(&s, period, n);
+        let (wf, phase, _ps) = an.compute_waveform(&s, period, n);
 
         // Lock check: the tick must sit near the middle of the folded window.
         let wf_max = wf.iter().cloned().fold(0f32, f32::max);
@@ -119,6 +119,11 @@ impl CalibrationState {
         };
         let phase_tick = ((ts + phase as u64 + tick_i as u64) as f64 / sr as f64).fract();
 
+        // One fold-measured phase point per window, on a decoupled time
+        // axis (window-boundary seconds): coupling the phase to the
+        // tick's own arrival time collapses the fit's information (the
+        // phase would be a deterministic function of the time axis, and
+        // the drift would never show). This is tg's construction.
         let start = *self.start_ts.get_or_insert(ts);
         let time = (ts - start) as f64 / sr as f64;
         if self.points.is_empty() || time > self.points.last().unwrap().0 + 0.9 {
@@ -128,7 +133,10 @@ impl CalibrationState {
         // Try to finish early: once enough points have been collected,
         // refit on every new sample and stop as soon as the confidence
         // interval is tight enough (tg always waits for all 900 points).
-        let min_points = self.need.min(60);
+        // Points are one per 4-second window; 20 points (~80 s) is the
+        // shortest run worth fitting, and the robust inlier cut in the
+        // fit tolerates a bad window. The 0.1 s/d gate decides the rest.
+        let min_points = self.need.min(20);
         if self.points.len() >= min_points {
             if let Ok(cal) = Self::fit(&self.points) {
                 self.cal = Some(cal);
@@ -147,9 +155,10 @@ impl CalibrationState {
     /// sound card's apparent rate error.
     fn fit(points: &[(f64, f64)]) -> Result<f64, ()> {
         let (cal, delta) = Self::fit_with_delta(points)?;
-        // tg gates at 0.1 s/d; 0.2 is still far finer than the rate readout
-        // and roughly halves the convergence time.
-        if delta >= 0.2 {
+        // tg's exact gate: the fit must be certain to 0.1 s/d. Loosening
+        // this accelerated convergence but let correlated, overlapping
+        // windows exit early with a biased fit.
+        if delta >= 0.1 {
             return Err(());
         }
         Ok(cal)
@@ -167,14 +176,39 @@ impl CalibrationState {
             y += (p * 2.0 * std::f64::consts::PI).sin();
         }
         let c = (y.atan2(x) - std::f64::consts::PI) / (2.0 * std::f64::consts::PI);
-        let adjusted: Vec<(f64, f64)> = points
-            .iter()
-            .map(|&(t, p)| (t, (p - c).fract()))
-            .collect();
-        let t_av = adjusted.iter().map(|&(t, _)| t).sum::<f64>() / n as f64;
-        let p_av = adjusted.iter().map(|&(_, p)| p).sum::<f64>() / n as f64;
+        // Continuous unwrap: center on the circular mean, then remove
+        // +/-1 jumps between successive points. Without this, a phase
+        // drift that crosses the 0/1 branch cut mid-run splits the point
+        // cluster across the cut and the least-squares fit sees a phase
+        // jump of a full second — a garbage slope and a huge delta (the
+        // calibration silently fails or exits wildly wrong).
+        let mut adjusted: Vec<(f64, f64)> = Vec::with_capacity(n);
+        let mut prev: Option<f64> = None;
+        for &(t, p) in points.iter() {
+            let mut u = (p - c).fract();
+            if let Some(pv) = prev {
+                while u - pv > 0.5 {
+                    u -= 1.0;
+                }
+                while u - pv < -0.5 {
+                    u += 1.0;
+                }
+            }
+            prev = Some(u);
+            adjusted.push((t, u));
+        }
+        // Robust two-pass fit inliers only: a single bad window (a
+        // poorly anchored fold, a stray noise tick) would otherwise drag
+        // the slope and inflate delta; the regression is re-fit after
+        // discarding points whose residual exceeds 4 robust sigmas.
+        let inliers = robust_inliers(&adjusted);
+        if inliers.len() < 3 {
+            return Err(());
+        }
+        let t_av = inliers.iter().map(|&(t, _)| t).sum::<f64>() / inliers.len() as f64;
+        let p_av = inliers.iter().map(|&(_, p)| p).sum::<f64>() / inliers.len() as f64;
         let (mut xx, mut xy, mut yy) = (0.0, 0.0, 0.0);
-        for &(t, p) in adjusted.iter() {
+        for &(t, p) in inliers.iter() {
             let dt = t - t_av;
             let dp = p - p_av;
             xx += dt * dt;
@@ -185,9 +219,47 @@ impl CalibrationState {
             return Err(());
         }
         let calibration = xy * 3600.0 * 24.0 / xx;
-        let delta = ((xx * yy - xy * xy) / (n as f64 - 2.0)).sqrt() / xx;
+        let delta = ((xx * yy - xy * xy) / (inliers.len() as f64 - 2.0)).sqrt() / xx;
         Ok((calibration, delta * 3600.0 * 24.0))
     }
+}
+
+fn robust_inliers(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    // Initial least-squares fit, residuals, MAD-based outlier cut,
+    // second fit on the survivors.
+    let n = points.len();
+    if n < 5 {
+        return points.to_vec();
+    }
+    let t_av = points.iter().map(|&(t, _)| t).sum::<f64>() / n as f64;
+    let p_av = points.iter().map(|&(_, p)| p).sum::<f64>() / n as f64;
+    let (mut xx, mut xy) = (0.0, 0.0);
+    for &(t, p) in points.iter() {
+        let dt = t - t_av;
+        xx += dt * dt;
+        xy += dt * (p - p_av);
+    }
+    if xx == 0.0 {
+        return points.to_vec();
+    }
+    let slope = xy / xx;
+    let resid: Vec<f64> = points
+        .iter()
+        .map(|&(t, p)| (p - p_av) - slope * (t - t_av))
+        .collect();
+    let mut sorted = resid.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mad = (sorted[sorted.len() / 2]).abs().max(1e-12);
+    let keep: Vec<usize> = resid
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.abs() < 4.0 * mad)
+        .map(|(i, _)| i)
+        .collect();
+    if keep.len() < 5 {
+        return points.to_vec();
+    }
+    keep.into_iter().map(|i| points[i]).collect()
 }
 
 #[cfg(test)]
@@ -209,19 +281,19 @@ mod tests {
             amplitude_deg: 250.0,
             quartz: true,
         };
-        let samples = quartz.generate(SR, 44.0);
+        let samples = quartz.generate(SR, 160.0);
         let an = Analyzer::for_calibration(SR);
-        let mut state = CalibrationState::with_size(30);
+        let mut state = CalibrationState::with_size(60);
         let win = 4 * SR as usize;
         for i in 0..40 {
-            let start = i * SR as usize;
+            let start = i * win;
             if start + win > samples.len() {
                 break;
             }
-            let st = state.add_block(&an, &samples[start..start + win], (i as u64) * SR as u64);
+            let st = state.add_block(&an, &samples[start..start + win], start as u64);
             match st {
                 CalStatus::Done(cal) => {
-                    assert!((cal - (-15.0)).abs() < 2.0, "calibration: {cal}");
+                    assert!((cal - (-15.0)).abs() < 1.0, "calibration: {cal}");
                     return;
                 }
                 CalStatus::Failed => panic!("calibration failed quality check"),
