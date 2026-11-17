@@ -46,11 +46,12 @@ pub fn spawn_capture(tx: Sender<f32>) -> Result<()> {
         .default_input_config()
         .context("no supported input configuration")?;
     let channels = supported.channels() as usize;
+    let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
     let mut resampler = Resampler::new(config.sample_rate.0 as f64);
     let tx_f32 = tx.clone();
 
-    let stream = match supported.sample_format() {
+    let stream = match sample_format {
         cpal::SampleFormat::F32 => device.build_input_stream(
             &config,
             move |data: &[f32], _| {
