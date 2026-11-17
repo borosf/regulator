@@ -174,12 +174,13 @@ impl RegulatorApp {
                 let cc_est = clock_cal.lock().unwrap_or_else(|e| e.into_inner()).estimate();
                 if let Some((err, unc)) = cc_est {
                     // `p` is already held here; re-locking params would
-                    // deadlock (std Mutex is not reentrant).
+                    // deadlock (std Mutex is not reentrant). The clock
+                    // estimate is informational only: it measures the
+                    // sound card against the local timer, whose own
+                    // drift is unknown (tens of s/day on some hardware),
+                    // so it is never auto-applied. The quartz calibration
+                    // is the authoritative correction.
                     p.cal_live = Some((err, unc));
-                    if unc <= 0.25 && (p.cal_auto || p.calibration == 0.0) {
-                        p.calibration = err;
-                        p.cal_auto = true;
-                    }
                 }
                 drop(p);
                 let p2 = params_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -351,10 +352,10 @@ impl eframe::App for RegulatorApp {
                     strip_value(ui, "cal", &Some(format!("{:+.1} s/d{tag}", p.calibration)));
                 } else if let Some((err, unc)) = p.cal_live {
                     ui.label(
-                        egui::RichText::new(format!("cal {err:+.1} ±{unc:.1}"))
+                        egui::RichText::new(format!("clock {err:+.1} ±{unc:.1}"))
                             .monospace()
                             .size(14.0)
-                            .color(egui::Color32::from_rgb(235, 200, 90)),
+                            .color(egui::Color32::from_gray(140)),
                     );
                     ui.add_space(12.0);
                 }
@@ -411,6 +412,12 @@ impl eframe::App for RegulatorApp {
                     p.demo = false;
                     p.calibrating = true;
                     p.cal_progress.clear();
+                }
+                if let Some((err, unc)) = p.cal_live {
+                    if unc < 2.0 && ui.button(format!("use clock est {err:+.1}")).clicked() {
+                        p.calibration = err;
+                        p.cal_auto = true;
+                    }
                 }
                 ui.add_space(10.0);
                 ui.separator();
