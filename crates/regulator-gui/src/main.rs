@@ -173,7 +173,8 @@ impl RegulatorApp {
                 // has set the value manually).
                 let cc_est = clock_cal.lock().unwrap_or_else(|e| e.into_inner()).estimate();
                 if let Some((err, unc)) = cc_est {
-                    let mut p = params_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    // `p` is already held here; re-locking params would
+                    // deadlock (std Mutex is not reentrant).
                     p.cal_live = Some((err, unc));
                     if unc <= 0.25 && (p.cal_auto || p.calibration == 0.0) {
                         p.calibration = err;
