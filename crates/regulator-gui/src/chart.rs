@@ -116,8 +116,8 @@ pub fn export_chart(
     const WINDOW_MS: f64 = 25.0;
     let top = 60.0;
     let chart_h = H - top - 10.0;
-    let cx = W / 2.0;
-    let half_w = W / 2.0 - 20.0;
+    let cy = top + chart_h / 2.0;
+    let half_h = chart_h / 2.0;
     let wrap = |ms: f64| {
         ((ms + WINDOW_MS) % (2.0 * WINDOW_MS) + 2.0 * WINDOW_MS) % (2.0 * WINDOW_MS) - WINDOW_MS
     };
@@ -137,27 +137,26 @@ pub fn export_chart(
         p.lift_angle
     );
     for ms in [-20.0, -10.0, 0.0, 10.0, 20.0] {
-        let x = cx + wrap(ms) / WINDOW_MS * half_w;
+        let y = cy - wrap(ms) / WINDOW_MS * half_h;
         let color = if ms == 0.0 { "#3a3a3a" } else { "#1c1c1c" };
         let _ = writeln!(
             svg,
-            "<line x1=\"{x:.1}\" y1=\"{top}\" x2=\"{x:.1}\" y2=\"{:.1}\" stroke=\"{color}\"/>",
-            top + chart_h
+            "<line x1=\"12\" y1=\"{y:.1}\" x2=\"{}\" y2=\"{y:.1}\" stroke=\"{color}\"/>",
+            W - 12.0
         );
     }
     let t_end = trace.last().map(|t| t.t).unwrap_or(0.0);
     for t in trace.iter().filter(|t| t_end - t.t <= 60.0) {
-        let y = top + chart_h - (t_end - t.t) / 60.0 * chart_h;
-        let x = cx + wrap(t.phase_ms) / WINDOW_MS * half_w;
+        let x = W - 12.0 - (t_end - t.t) / 60.0 * (W - 24.0);
+        let y = cy - wrap(t.phase_ms) / WINDOW_MS * half_h;
         let color = if t.tic { "#8ce68c" } else { "#f08cf0" };
         let _ = writeln!(
             svg,
-            "<line x1=\"{:.1}\" y1=\"{y:.1}\" x2=\"{:.1}\" y2=\"{y:.1}\" stroke=\"{color}\" stroke-width=\"1.6\"/>",
-            x - 1.5,
-            x + 1.5
+            "<line x1=\"{x:.1}\" y1=\"{y:.1}\" x2=\"{x:.1}\" y2=\"{y:.1}\" stroke=\"{color}\" stroke-width=\"1.6\"/>"
         );
     }
     let _ = writeln!(svg, "</svg>");
     std::fs::write(format!("{base}.svg"), svg).ok()?;
+    crate::sheet::export_jpeg(&base, trace, result, params)?;
     Some(base)
 }

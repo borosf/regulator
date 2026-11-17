@@ -1,63 +1,97 @@
 # regulator
 
-A modern fork of [tg](https://github.com/xyzzy42/tg) — open-source watch
-timing software for mechanical movements. regulator captures the ticking of
-a watch with a microphone, analyzes the tick train, and reports the rate
-error (s/day), balance amplitude, and beat error, with a cleaner interface
-and a restructured, testable analysis core.
+A modern, free-software watch timing machine — a Rust rewrite of
+[tg](https://github.com/xyzzy42/tg), the open-source mechanical-watch
+timing program. Put a watch on a microphone and regulator measures the
+rate error, balance amplitude, and beat error, live, with a clean
+instrument-style interface.
 
-## Status
+![screenshot](docs/screenshot.jpg)
 
-Early-stage Rust rewrite. The original C code (GPLv2) is kept at the root of
-the repository as the reference implementation and for its build system; see
-[docs/original-readme.md](docs/original-readme.md) for the original project's
-documentation, including the microphone calibration procedure.
+## Features
 
-## Layout
-
-- `crates/regulator-core` — pure DSP: noise suppression, FFT-based period
-  detection, waveform folding, rate/amplitude/beat-error computation. No I/O,
-  fully unit-tested against a synthetic watch signal generator.
-- `crates/regulator-tui` — the terminal interface (ratatui), with live
-  microphone capture (cpal) and a `--demo` mode driven by a synthetic watch.
-- `crates/regulator-gui` — the graphical interface (egui): big readouts,
-  waveform plot, settings panel; same demo/microphone sources.
+- **Live measurement** of rate (s/day), amplitude (degrees) and beat
+  error (ms), with each value reported independently — a measurement that
+  fails is shown blank instead of breaking the whole readout.
+- **Auto beat-rate detection** with snapping to standard rates
+  (12000–43200 bph, including 36000 and 43200 high-beat movements).
+- **Strip chart trace**: time runs left to right, phase error moves up
+  and down, tic and toc in different colors — the classic timegrapher
+  view.
+- **Sound-card calibration** against a quartz watch ticking once per
+  second, with live progress feedback and an early exit once the estimate
+  converges.
+- **Export**: chart as SVG, raw trace as CSV, and a branded JPEG result
+  sheet with all readouts, ready to attach to a service record.
+- **Demo mode**: a synthetic watch drives every feature with no hardware.
 
 ## Build & run
 
 ```sh
-cargo run -p regulator-tui -- --demo  # synthetic watch, no hardware needed
-cargo run -p regulator-tui            # live microphone (needs ALSA/CoreAudio/WASAPI)
-cargo run -p regulator-gui            # graphical interface (demo mode by default)
+cargo run -p regulator-gui   # graphical interface (demo mode by default)
 ```
 
-Useful keys: `←/→` beat rate preset (auto, 18000…36000 bph), `+/-` lift
-angle, `n` noise suppressor, `q` quit.
+Uncheck "demo signal" in the side panel to analyze the microphone. On
+Linux you may need `libasound2-dev`; on Windows and macOS it just works.
 
 To build on a system without an audio stack:
 
 ```sh
 cargo build --no-default-features
+cargo test
 ```
+
+## Using it
+
+1. Rest the watch on a microphone (a piezo contact mic or the watch
+   directly on a laptop mic both work).
+2. Pick the beat rate, or leave it on auto.
+3. Set the lift angle for the movement (52° is a safe default; check the
+   movement's spec).
+4. Read the rate. The trace confirms it: a rising drift means fast, a
+   falling drift means slow, two horizontal bands mean beat error.
+5. To calibrate the sound card, click "calibrate (quartz)" and place a
+   quartz watch (exactly 1 tick/s) on the microphone for a minute or two.
+   The correction persists between runs.
+
+## Layout
+
+- `crates/regulator-core` — pure DSP: filters, FFT-based period
+  detection, waveform folding, rate/amplitude/beat-error computation,
+  calibration. No I/O, fully unit-tested against a synthetic watch.
+- `crates/regulator-gui` — the graphical interface (egui). **This is the
+  main frontend.**
+- `crates/regulator-tui` — the terminal interface (ratatui). **Experimental:**
+  it lags behind the GUI in features and polish and may be removed or
+  reworked.
 
 ## Improvements over tg
 
-- Partial results: rate, beat error and amplitude are reported independently;
-  a missing measurement is shown blank rather than failing the whole readout.
-- Sub-sample period refinement (parabolic interpolation of the autocorrelation
-  peak) for finer rate resolution than tg's integer-sample estimate.
-- Robust amplitude estimation: the impulse duration is measured directly as
-  the region above 20% of the tic/toc peak, instead of tg's escalating
-  threshold heuristic.
-- Cached FFT plans and reused scratch buffers: plans are built once per
-  block length instead of per call.
+- Partial results: rate, beat error and amplitude are reported
+  independently; a missing measurement is blank, not fatal.
+- Sub-sample period refinement (parabolic interpolation of the
+  autocorrelation peak) for finer rate resolution.
+- Cached FFT plans and reused scratch buffers.
+- Faster calibration: the quartz fit exits early once the estimate
+  converges instead of always collecting the full 900-second window.
+- Modern cross-platform GUI with a result-sheet export.
 
-## Portability
+The original C code (GPLv2) is kept at the root of the repository as the
+reference implementation; see [docs/original-readme.md](docs/original-readme.md)
+for the original project's documentation.
 
-The core crate has no platform dependencies (pure Rust, no C). Both
-frontends use cpal for capture, which works on Linux (ALSA), macOS
-(CoreAudio) and Windows (WASAPI); without the `audio` feature they build
-anywhere Rust does.
+## Known limitations
+
+- The passive clock estimate (sound card vs. local timer) is
+  informational only: many machines' timers drift by tens of s/day, so
+  only the quartz calibration is applied to measurements.
+- Tick events are located by peak search around expected positions, not
+  template matching; very noisy recordings may drop events.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Bug reports and feature requests
+are welcome via the issue tracker.
 
 ## License
 

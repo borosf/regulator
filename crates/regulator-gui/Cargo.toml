@@ -18,4 +18,5 @@ audio = ["dep:cpal"]
 regulator-core = { path = "../regulator-core" }
 eframe = "0.33"
 anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 cpal = { version = "0.15", optional = true }

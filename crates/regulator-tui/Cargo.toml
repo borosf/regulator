@@ -1,6 +1,6 @@
 [package]
 name = "regulator-tui"
-description = "Terminal UI for the regulator watch timing machine"
+description = "Experimental terminal UI for the regulator watch timing machine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

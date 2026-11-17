@@ -65,7 +65,9 @@ impl FftCache {
 
 /// Snap a detected beats-per-hour value to the nearest standard beat rate.
 fn snap_bph(detected: f64) -> f64 {
-    const STANDARDS: [f64; 7] = [12000.0, 14400.0, 18000.0, 21600.0, 25200.0, 28800.0, 36000.0];
+    const STANDARDS: [f64; 9] = [
+        12000.0, 14400.0, 18000.0, 19800.0, 21600.0, 25200.0, 28800.0, 36000.0, 43200.0,
+    ];
     STANDARDS
         .iter()
         .copied()
@@ -158,12 +160,11 @@ impl Analyzer {
                     }
                     // Only accept a peak that actually rises above the
                     // local noise floor; otherwise the tick was missed.
-                    let (peak, _) = vmax(&s, a, b + 1);
+                    let (peak, i_max) = vmax(&s, a, b + 1);
                     let med = median(&mut s[a..=b].to_vec());
                     if peak <= 0.0 || peak < 2.0 * med {
                         continue;
                     }
-                    let (_, i_max) = vmax(&s, a, b + 1);
                     events.push((i_max as f64, is_tic));
                 }
             }

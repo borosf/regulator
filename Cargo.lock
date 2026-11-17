@@ -1751,6 +1751,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2941,6 +2943,7 @@ dependencies = [
  "anyhow",
  "cpal",
  "eframe",
+ "image",
  "regulator-core",
 ]
 

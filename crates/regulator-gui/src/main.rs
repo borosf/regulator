@@ -5,6 +5,7 @@
 #[cfg(feature = "audio")]
 mod audio;
 mod chart;
+mod sheet;
 
 use eframe::egui;
 use regulator_core::{CalStatus, CalibrationState, ClockCal, Analyzer, SyntheticWatch, TimingResult};
@@ -521,51 +522,52 @@ fn strip_value(ui: &mut egui::Ui, name: &str, value: &Option<String>) {
     ui.add_space(12.0);
 }
 
-/// The strip chart: each tick event is a short dash at its phase error;
-/// time scrolls downward. Rate error drifts the dashes sideways, beat
-/// error splits tic/toc into two columns, noise widens the scatter.
+/// The strip chart: time runs left to right, phase error moves up and
+/// down (tg's orientation). Rate error shows as a rising or falling drift,
+/// beat error splits tic/toc into two horizontal bands, noise widens the
+/// scatter.
 fn draw_trace(ui: &mut egui::Ui, trace: &[TracePoint]) {
     let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
     let rect = resp.rect;
     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(10, 11, 12));
     // Phase-error window: +/- 25 ms, ticks wrap into it.
     const WINDOW_MS: f64 = 25.0;
-    let cx = rect.center().x;
-    let half_w = rect.width() / 2.0 - 8.0;
-    let to_x = |ms: f64| {
+    const SPAN_S: f64 = 60.0;
+    let cy = rect.center().y;
+    let half_h = rect.height() / 2.0 - 8.0;
+    let to_y = |ms: f64| {
         let wrapped = ((ms + WINDOW_MS) % (2.0 * WINDOW_MS) + 2.0 * WINDOW_MS) % (2.0 * WINDOW_MS) - WINDOW_MS;
-        cx + (wrapped / WINDOW_MS * half_w as f64) as f32
+        cy - (wrapped / WINDOW_MS * half_h as f64) as f32
     };
-    // Grid: center line plus 10 ms steps.
+    // Grid: center line plus 10 ms steps, horizontal like tg's display.
     for ms in [-20.0, -10.0, 0.0, 10.0, 20.0] {
-        let x = to_x(ms);
+        let y = to_y(ms);
         let color = if ms == 0.0 {
             egui::Color32::from_gray(52)
         } else {
             egui::Color32::from_gray(28)
         };
         painter.line_segment(
-            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
             egui::Stroke::new(1.0_f32, color),
         );
     }
-    let bottom = rect.bottom();
-    let h = rect.height();
     let t_end = trace.last().map(|q| q.t).unwrap_or(0.0);
+    let w = rect.width();
     for p in trace {
         let age = t_end - p.t;
-        if age > 60.0 {
+        if age > SPAN_S {
             continue;
         }
-        let y = bottom - (age / 60.0 * h as f64) as f32;
-        let x = to_x(p.phase_ms);
+        let x = rect.right() - (age / SPAN_S * w as f64) as f32;
+        let y = to_y(p.phase_ms);
         let color = if p.tic {
             egui::Color32::from_rgb(140, 230, 140)
         } else {
             egui::Color32::from_rgb(240, 140, 240)
         };
         painter.line_segment(
-            [egui::pos2(x - 1.5, y), egui::pos2(x + 1.5, y)],
+            [egui::pos2(x, y - 1.5), egui::pos2(x, y + 1.5)],
             egui::Stroke::new(1.6_f32, color),
         );
     }
