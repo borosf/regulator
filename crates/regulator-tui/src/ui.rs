@@ -48,35 +48,35 @@ fn draw_readout(f: &mut ratatui::Frame, area: Rect, res: &Option<TimingResult>) 
         .constraints([Constraint::Ratio(1, 3); 3])
         .split(area);
 
+    let blank = ("---".to_string(), Color::DarkGray);
     let (rate, amp, be) = match res {
         Some(r) => (
-            (
-                format!("{:+.1}", r.rate_sday),
-                " s/day",
-                rate_color(r.rate_sday),
-            ),
-            (
-                match r.amplitude_deg {
-                    Some(a) => format!("{a:.0}"),
-                    None => "---".into(),
-                },
-                " deg",
-                Color::Cyan,
-            ),
-            (format!("{:+.2}", r.beat_error_ms), " ms", Color::Magenta),
+            match r.rate_sday {
+                Some(v) => (format!("{v:+.1}"), rate_color(v)),
+                None => blank.clone(),
+            },
+            match r.amplitude_deg {
+                Some(v) => (format!("{v:.0}"), Color::Cyan),
+                None => blank.clone(),
+            },
+            match r.beat_error_ms {
+                Some(v) => (format!("{v:+.2}"), Color::Magenta),
+                None => blank.clone(),
+            },
         ),
-        None => (
-            ("---".into(), " s/day", Color::DarkGray),
-            ("---".into(), " deg", Color::DarkGray),
-            ("---".into(), " ms", Color::DarkGray),
-        ),
+        None => (blank.clone(), blank.clone(), blank),
     };
-    for (col, (title, (val, unit, color))) in ["Rate", "Amplitude", "Beat error"]
-        .into_iter()
-        .zip([rate, amp, be])
-        .enumerate()
+    for (col, (title, (val, color), unit)) in [
+        ("Rate", rate, " s/day"),
+        ("Amplitude", amp, " deg"),
+        ("Beat error", be, " ms"),
+    ]
+    .into_iter()
+    .enumerate()
     {
-        let block = Block::default().borders(Borders::ALL).title(format!(" {title} "));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {title} "));
         f.render_widget(block, cols[col]);
         let a = cols[col].inner(Margin::new(2, 1));
         let p = Paragraph::new(Line::from(vec![
@@ -110,21 +110,36 @@ fn draw_waveform(f: &mut ratatui::Frame, area: Rect, res: &Option<TimingResult>)
     if wf.is_empty() {
         return;
     }
+
+    // Scale so the largest excursion fits the panel.
     let max = wf.iter().cloned().fold(0f32, f32::max).max(1e-9);
     let mid = inner.height as f32 / 2.0;
+    let scale = (mid - 1.0) / max;
+    let tic_x = r.tic.map(|t| t as u32 * inner.width as u32 / wf.len() as u32);
+
     for x in 0..inner.width {
         let i = x as usize * wf.len() / inner.width as usize;
-        let v = wf[i.min(wf.len() - 1)] / max;
-        let h = ((v.abs() * mid).ceil() as u16).clamp(1, inner.height);
+        let v = wf[i.min(wf.len() - 1)] * scale;
+        let h = ((v.abs() * mid).ceil() as u16).clamp(1, inner.height) as u16;
         let y = if v >= 0.0 {
             (mid as u16).saturating_sub(h)
         } else {
             mid as u16
         };
-        let style = Style::default().fg(if v >= 0.0 { Color::Green } else { Color::Red });
+        // Tic/toc position marker column.
+        let is_marker = tic_x.is_some_and(|tx| (x as u32).abs_diff(tx) <= 1);
+        let style = if is_marker {
+            Style::default().fg(Color::Yellow)
+        } else if v >= 0.0 {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::Red)
+        };
         for dy in 0..h {
             let py = (inner.y + y + dy).min(inner.y + inner.height - 1);
-            f.buffer_mut()[(inner.x + x, py)].set_char('█').set_style(style);
+            f.buffer_mut()[(inner.x + x, py)]
+                .set_char(if is_marker { '▓' } else { '█' })
+                .set_style(style);
         }
     }
 }

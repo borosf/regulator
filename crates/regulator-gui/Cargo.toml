@@ -1,0 +1,21 @@
+[package]
+name = "regulator-gui"
+description = "Graphical UI for the regulator watch timing machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "regulator-gui"
+path = "src/main.rs"
+
+[features]
+default = ["audio"]
+audio = ["dep:cpal"]
+
+[dependencies]
+regulator-core = { path = "../regulator-core" }
+eframe = "0.33"
+anyhow = "1"
+cpal = { version = "0.15", optional = true }

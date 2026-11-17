@@ -26,7 +26,7 @@ impl SyntheticWatch {
         let n = (duration_s * sample_rate as f64) as usize;
         let mut out = vec![0f32; n];
         let sr = sample_rate as f64;
-        let burst_len = (0.004 * sr) as usize;
+        let burst_len = (0.02 * sr) as usize;
         let mut t = 0.0f64;
         let mut flip = false;
         let mut rng = 0x1234_5678u64;
@@ -48,11 +48,19 @@ impl SyntheticWatch {
                     * (0.5 / amp_abs).asin()
                     / std::f64::consts::PI
                     * sr) as usize;
-                for i in 0..width.min(burst_len) {
+                let width = width.min(burst_len);
+                for i in 0..width {
                     let tt = i as f64 / sr;
-                    let env = (-tt * 1500.0).exp();
+                    // Sharp attack at the unlock, exponential decay: like a
+                    // real impulse, the sound starts at the tick and rings
+                    // down. The analyzer measures the duration above 20% of
+                    // the peak, which tracks `width`.
+                    let env = (-1.6 * i as f64 / width as f64).exp();
                     let carrier = (2.0 * std::f64::consts::PI * 3500.0 * tt).sin();
-                    out[base + i] += (env * carrier * 0.8) as f32;
+                    let idx = base as isize + i as isize;
+                    if idx >= 0 && (idx as usize) < n {
+                        out[idx as usize] += (env * carrier * 0.8) as f32;
+                    }
                 }
             }
             flip = !flip;
@@ -93,7 +101,7 @@ mod tests {
         let mut an = Analyzer::new(SR);
         an.bph = 28800;
         let r = an.analyze(&samples).expect("analysis failed");
-        assert!((r.rate_sday - 12.0).abs() < 3.0, "rate: {}", r.rate_sday);
+        assert!((r.rate_sday.unwrap() - 12.0).abs() < 3.0, "rate: {:?}", r.rate_sday);
     }
 
     #[test]
@@ -127,10 +135,26 @@ mod tests {
         an.bph = 21600;
         let r = an.analyze(&samples).expect("analysis failed");
         assert!(
-            (r.beat_error_ms - 1.2).abs() < 0.8,
-            "beat error: {}",
+            (r.beat_error_ms.unwrap() - 1.2).abs() < 0.8,
+            "beat error: {:?}",
             r.beat_error_ms
         );
+    }
+
+    #[test]
+    fn detects_amplitude() {
+        let watch = SyntheticWatch {
+            bph: 28800,
+            rate_sday: 0.0,
+            beat_error_ms: 0.0,
+            amplitude_deg: 270.0,
+        };
+        let samples = watch.generate(SR, 4.0);
+        let mut an = Analyzer::new(SR);
+        an.bph = 28800;
+        let r = an.analyze(&samples).expect("analysis failed");
+        let amp = r.amplitude_deg.expect("amplitude not found");
+        assert!((amp - 270.0).abs() < 25.0, "amplitude: {amp}");
     }
 
     #[test]

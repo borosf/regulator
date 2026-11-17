@@ -1,45 +1,77 @@
 // SPDX-License-Identifier: GPL-2.0
-//! The timing analysis pipeline, ported from tg's algo.c.
+//! The timing analysis pipeline, ported from tg's algo.c, with improvements:
+//! cached FFT plans, buffer reuse, and sub-sample period refinement.
 
 use crate::filters::Biquad;
 use crate::stats::{median, tmean, vmax};
 use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
-use std::cell::Cell;
+use rustfft::{Fft, FftDirection, FftPlanner};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-/// Result of one analysis pass over a block of audio.
-#[derive(Clone, Debug)]
+/// Result of one analysis pass over a block of audio. Fields are None when
+/// that particular measurement could not be determined from the signal.
+#[derive(Clone, Debug, Default)]
 pub struct TimingResult {
-    /// Detected period in samples (time between consecutive ticks).
+    /// Detected period in samples (time between same-type ticks).
     pub period: f64,
     /// Rate error in seconds per day (positive = fast).
-    pub rate_sday: f64,
+    pub rate_sday: Option<f64>,
     /// Beat error in milliseconds (tic-to-toc asymmetry).
-    pub beat_error_ms: f64,
-    /// Balance amplitude in degrees, if it could be determined.
+    pub beat_error_ms: Option<f64>,
+    /// Balance amplitude in degrees.
     pub amplitude_deg: Option<f64>,
     /// Standard deviation of the period estimate in samples.
     pub sigma: f64,
     /// Folded average waveform over one period, median-subtracted.
     pub waveform: Vec<f32>,
-    /// Beat rate in beats per hour the rate was computed against.
+    /// Beat rate the rate was computed against.
     pub bph: u32,
+    /// Position of the tic peak in the folded waveform, if found.
+    pub tic: Option<usize>,
 }
 
-/// Configurable analyzer. Reuse one instance across blocks; it caches the
-/// FFT plans and filter state.
+struct FftCache {
+    plans: HashMap<usize, Arc<dyn Fft<f32>>>,
+    scratch: Vec<Complex<f32>>,
+}
+
+impl FftCache {
+    fn new() -> Self {
+        FftCache {
+            plans: HashMap::new(),
+            scratch: Vec::new(),
+        }
+    }
+
+    fn plan(&mut self, len: usize, direction: FftDirection) -> Arc<dyn Fft<f32>> {
+        // rustfft plans are direction-specific; key on len and direction bit.
+        let key = len * 2 + (direction == FftDirection::Inverse) as usize;
+        if !self.plans.contains_key(&key) {
+            let mut planner = FftPlanner::new();
+            let fft = match direction {
+                FftDirection::Forward => planner.plan_fft_forward(len),
+                FftDirection::Inverse => planner.plan_fft_inverse(len),
+            };
+            self.plans.insert(key, fft);
+        }
+        self.plans.get(&key).unwrap().clone()
+    }
+}
+
 /// Snap a detected beats-per-hour value to the nearest standard beat rate.
 fn snap_bph(detected: f64) -> f64 {
     const STANDARDS: [f64; 7] = [12000.0, 14400.0, 18000.0, 21600.0, 25200.0, 28800.0, 36000.0];
     STANDARDS
         .iter()
         .copied()
-        .min_by(|a, b| {
-            (a - detected).abs().partial_cmp(&(b - detected).abs()).unwrap()
-        })
+        .min_by(|a, b| (a - detected).abs().partial_cmp(&(b - detected).abs()).unwrap())
         .unwrap_or(28800.0)
 }
 
+/// Configurable analyzer. Reuse one instance across blocks; it caches FFT
+/// plans and reuses scratch buffers.
 pub struct Analyzer {
     pub sample_rate: u32,
     /// Beats per hour of the movement under test; 0 = auto-detect.
@@ -49,8 +81,11 @@ pub struct Analyzer {
     /// Enable the impulsive-noise suppressor.
     pub noise_suppressor: bool,
     lpf: Biquad,
+    fft: RefCell<FftCache>,
     last_sigma: Cell<f64>,
 }
+
+use std::cell::Cell;
 
 impl Analyzer {
     pub fn new(sample_rate: u32) -> Self {
@@ -60,13 +95,15 @@ impl Analyzer {
             lift_angle: 52.0,
             noise_suppressor: true,
             lpf: Biquad::low_pass(crate::FILTER_CUTOFF / sample_rate as f64),
+            fft: RefCell::new(FftCache::new()),
             last_sigma: Cell::new(0.0),
         }
     }
 
     /// Analyze one block of samples. `samples` should be at least one second
-    /// long; several seconds gives more stable results. Returns None when no
-    /// plausible tick train was found.
+    /// long; several seconds gives more stable results. Returns None only
+    /// when no tick train at all could be found; individual measurements
+    /// that fail are None inside the result.
     pub fn analyze(&self, samples: &[f32]) -> Option<TimingResult> {
         if samples.len() < self.sample_rate as usize {
             return None;
@@ -78,8 +115,15 @@ impl Analyzer {
         self.prepare_data(&mut s);
         let period = self.compute_period(&s, n)?;
         let waveform = self.compute_waveform(&s, period, n);
-        let (beat_error_ms, tic, toc) = self.compute_beat_error(&waveform, period)?;
-        let amplitude_deg = self.compute_amplitude(&waveform, period, tic, toc);
+        let (beat_error_ms, tic, toc) = match self.compute_beat_error(&waveform, period) {
+            Some((be, tic, toc)) => (be, Some(tic), Some(toc)),
+            None => (None, None, None),
+        };
+        let tic_idx = tic;
+        let amplitude_deg = match (tic, toc) {
+            (Some(tic), Some(toc)) => self.compute_amplitude(&waveform, period, tic, toc),
+            _ => None,
+        };
 
         let detected_bph = 2.0 * 3600.0 * sr as f64 / period;
         let bph = if self.bph != 0 {
@@ -92,18 +136,17 @@ impl Analyzer {
 
         Some(TimingResult {
             period,
-            rate_sday,
+            rate_sday: Some(rate_sday),
             beat_error_ms,
             amplitude_deg,
             sigma: self.last_sigma.get(),
             waveform,
             bph: bph as u32,
+            tic: tic_idx,
         })
     }
 
-    /// Rectify, low-pass, normalize and window the input; then compute the
-    /// autocorrelation into the second half of `s` (as tg does with
-    /// samples_sc).
+    /// Rectify, low-pass, normalize and window the input.
     fn prepare_data(&self, s: &mut Vec<f32>) {
         let n = s.len();
         let sr = self.sample_rate as usize;
@@ -166,19 +209,43 @@ impl Analyzer {
         }
     }
 
-    /// Autocorrelation of s (length n) via FFT; result has n points.
+    /// Autocorrelation of s (length n) via cached FFT plans; result has n
+    /// points. Unlike tg, the plans are created once per length and reused.
     fn autocorrelate(&self, s: &[f32], n: usize) -> Vec<f32> {
-        let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(2 * n);
+        let mut fft = self.fft.borrow_mut();
+        let forward = fft.plan(2 * n, FftDirection::Forward);
+        let inverse = fft.plan(2 * n, FftDirection::Inverse);
+        let scratch_len = forward.get_inplace_scratch_len().max(inverse.get_inplace_scratch_len());
+        fft.scratch.resize(scratch_len, Complex::default());
         let mut buf: Vec<Complex<f32>> = s.iter().map(|&v| Complex::new(v, 0.0)).collect();
         buf.resize(2 * n, Complex::default());
-        fft.process(&mut buf);
+        forward.process_with_scratch(&mut buf, &mut fft.scratch);
         for c in buf.iter_mut() {
             *c = *c * c.conj();
         }
-        let ifft = planner.plan_fft_inverse(2 * n);
-        ifft.process(&mut buf);
-        buf[..n].iter().map(|c| c.re).collect()
+        inverse.process_with_scratch(&mut buf, &mut fft.scratch);
+        buf.truncate(n);
+        buf.iter().map(|c| c.re).collect()
+    }
+
+    /// Parabolic interpolation around an integer peak of `ac` for a
+    /// sub-sample peak position. This refines the period estimate beyond
+    /// tg's integer-sample resolution, improving rate precision.
+    fn interpolate_peak(ac: &[f32], p: usize) -> f64 {
+        if p == 0 || p + 1 >= ac.len() {
+            return p as f64;
+        }
+        let (a, b, c) = (ac[p - 1] as f64, ac[p] as f64, ac[p + 1] as f64);
+        let denom = a - 2.0 * b + c;
+        if denom.abs() < 1e-12 {
+            return p as f64;
+        }
+        let delta = 0.5 * (a - c) / denom;
+        if delta.abs() <= 1.0 {
+            p as f64 + delta
+        } else {
+            p as f64
+        }
     }
 
     /// tg's peak_detector: the maximum of buff[a..=b] is accepted only if it
@@ -216,8 +283,7 @@ impl Analyzer {
     }
 
     /// Autocorrelation-based period estimation, ported from tg's
-    /// estimate_period(): find the first candidate peak, try submultiples,
-    /// and validate against the 1.5x peak.
+    /// estimate_period().
     fn estimate_period(&self, ac: &[f32], sr: usize) -> Option<usize> {
         let first = vmax(ac, sr / 12, sr.min(ac.len())).1;
         let a = (sr / 12).max(first.saturating_sub(sr / 12));
@@ -260,8 +326,10 @@ impl Analyzer {
         Some(estimate)
     }
 
-    /// Refine the period estimate by locating peaks at successive multiples,
-    /// averaging the per-cycle estimates, ported from tg's compute_period().
+    /// Refine the period estimate by locating peaks at successive multiples
+    /// and averaging the per-cycle estimates, ported from tg's
+    /// compute_period(). Unlike tg, the final estimate is refined with
+    /// parabolic interpolation for sub-sample period resolution.
     fn compute_period(&self, s: &[f32], n: usize) -> Option<f64> {
         let sr = self.sample_rate as usize;
         let ac = self.autocorrelate(s, n);
@@ -280,13 +348,15 @@ impl Analyzer {
         let mut sq_sum = 0.0;
         let mut count = 0;
         let mut cycle = 1usize;
+        let mut last_peak = 0usize;
         loop {
             let inf = (new_estimate * cycle as f64 - delta).floor() as usize;
             let sup = (new_estimate * cycle as f64 + delta).ceil() as usize;
             if sup > n * 2 / 3 || sup >= ac.len() {
                 break;
             }
-            new_estimate = Self::peak_detector(&ac, inf, sup)? as f64;
+            let peak = Self::peak_detector(&ac, inf, sup)?;
+            new_estimate = peak as f64;
             new_estimate /= cycle as f64;
             if new_estimate < estimate - delta || new_estimate > estimate + delta {
                 return None;
@@ -297,16 +367,26 @@ impl Analyzer {
                 count += 1;
             }
             cycle += 1;
+            last_peak = peak;
         }
         let period = if count > 0 { sum / count as f64 } else { estimate };
-        self.last_sigma
-            .set(if count > 1 {
-                ((sq_sum - count as f64 * period * period) / (count - 1) as f64).sqrt()
-            } else {
-                0.0
-            });
-        if period >= 1.2 * 3600.0 * 2.0 * sr as f64 / if self.bph != 0 { self.bph } else { 18000 } as f64 {
+        self.last_sigma.set(if count > 1 {
+            ((sq_sum - count as f64 * period * period) / (count - 1) as f64).sqrt()
+        } else {
+            0.0
+        });
+        if period >= 1.2 * 3600.0 * 2.0 * sr as f64 / if self.bph != 0 { self.bph } else { 18000 } as f64
+        {
             return None;
+        }
+        // Sub-sample refinement: interpolate the autocorrelation around the
+        // last accepted peak, expressed back as a per-period offset.
+        if last_peak > 0 && count > 0 {
+            let cycles = (last_peak as f64 / period).round().max(1.0);
+            let refined = Self::interpolate_peak(&ac, last_peak) / cycles;
+            if (refined - period).abs() < delta {
+                return Some(refined);
+            }
         }
         Some(period)
     }
@@ -373,7 +453,7 @@ impl Analyzer {
     /// Beat error: distance between the tic and toc peaks in the folded
     /// waveform, found via the waveform autocorrelation, ported from tg's
     /// compute_parameters(). Returns (beat error ms, tic index, toc index).
-    fn compute_beat_error(&self, wf: &[f32], period: f64) -> Option<(f64, usize, usize)> {
+    fn compute_beat_error(&self, wf: &[f32], period: f64) -> Option<(Option<f64>, usize, usize)> {
         let sr = self.sample_rate as usize;
         let n = wf.len();
         let ac = self.autocorrelate(wf, n);
@@ -403,11 +483,14 @@ impl Analyzer {
         }
         let tic = max_i;
         let toc = tic + tic_to_toc;
-        Some((be * 1000.0 / sr as f64, tic, toc))
+        Some((Some(be * 1000.0 / sr as f64), tic, toc))
     }
 
-    /// Amplitude from the tic/toc pulse widths, ported from tg's
-    /// compute_amplitude().
+    /// Amplitude from the tic/toc pulse widths. tg measures the distance
+    /// between an escalating threshold crossing and the smoothed peak, which
+    /// is fragile; regulator instead measures the duration the smoothed
+    /// pulse stays above 20% of its peak, which is the impulse duration the
+    /// amplitude formula wants: A/la = 0.5 / sin(pi * pulse / period).
     fn compute_amplitude(&self, wf: &[f32], period: f64, tic: usize, toc: usize) -> Option<f64> {
         let sr = self.sample_rate as usize;
         let wf_size = wf.len();
@@ -418,87 +501,49 @@ impl Analyzer {
         if smooth.is_empty() {
             return None;
         }
+        let wlen = smooth.len();
+        let max_walk = (period / 8.0) as usize;
 
-        let glob_max = vmax(&smooth, 0, smooth.len().min(period.ceil() as usize)).0;
-        if glob_max <= 0.0 {
-            return None;
-        }
-        let mut max = 0.0f32;
-        for &t in &[tic, toc] {
-            let mut j = ((t as f64 + period / 8.0) % period) as usize;
-            for _ in 0..(period / 8.0) as usize {
-                if smooth[j] > max {
-                    max = smooth[j];
-                }
-                j += 1;
-                if j as f64 > period {
-                    j = 0;
-                }
+        let mut amps = [0.0f64; 2];
+        for (k, &t) in [tic, toc].iter().enumerate() {
+            if t >= wlen {
+                return None;
             }
-        }
-        let mut threshold = (0.01 * glob_max).max(1.4 * max);
-
-        let mut tic_pulse;
-        let mut toc_pulse;
-        while threshold < 0.2 * glob_max {
-            tic_pulse = -1.0;
-            toc_pulse = -1.0;
-            let mut ok = true;
-            for (k, &t) in [toc, tic].iter().enumerate() {
-                let mut j = ((t as f64 + 7.0 * period / 8.0) % period) as usize;
-                let mut i = 0;
-                let eighth = (period / 8.0) as usize;
-                while i < eighth {
-                    if smooth[j] > threshold {
-                        break;
-                    }
-                    i += 1;
-                    j += 1;
-                    if j as f64 > period {
-                        j = 0;
-                    }
-                }
-                let mut max = 0.0f32;
-                while i < eighth {
-                    let x = smooth[j];
-                    if x > max {
-                        max = x;
-                    } else {
-                        break;
-                    }
-                    i += 1;
-                    j += 1;
-                    if j as f64 > period {
-                        j = 0;
-                    }
-                }
-                if i < eighth {
-                    let pulse = period / 8.0 - i as f64 - 1.0;
-                    if k == 0 {
-                        tic_pulse = pulse;
-                    } else {
-                        toc_pulse = pulse;
-                    }
-                } else {
-                    ok = false;
+            let peak = smooth[t];
+            if peak <= 0.0 {
+                return None;
+            }
+            let th = 0.2 * peak;
+            let mut lo = t;
+            for _ in 0..max_walk {
+                if smooth[(lo + wlen - 1) % wlen] <= th {
                     break;
                 }
+                lo = (lo + wlen - 1) % wlen;
             }
-            if ok {
-                let tic_amp_abs = 0.5 / (std::f64::consts::PI * tic_pulse / period).sin();
-                let toc_amp_abs = 0.5 / (std::f64::consts::PI * toc_pulse / period).sin();
-                let tic_amp = self.lift_angle * tic_amp_abs;
-                let toc_amp = self.lift_angle * toc_amp_abs;
-                if (135.0..360.0).contains(&tic_amp)
-                    && (135.0..360.0).contains(&toc_amp)
-                    && (tic_amp - toc_amp).abs() < 60.0
-                {
-                    return Some(self.lift_angle * (tic_amp_abs + toc_amp_abs) / 2.0);
+            let mut hi = t;
+            for _ in 0..max_walk {
+                if smooth[hi % wlen] <= th {
+                    break;
                 }
+                hi = (hi + 1) % wlen;
             }
-            threshold *= 1.4;
+            let span = (hi + wlen - lo) % wlen;
+            if span == 0 || span >= max_walk {
+                return None;
+            }
+            amps[k] = 0.5 / (std::f64::consts::PI * span as f64 / period).sin();
         }
-        None
+        let tic_amp = self.lift_angle * amps[0];
+        let toc_amp = self.lift_angle * amps[1];
+        if (135.0..360.0).contains(&tic_amp)
+            && (135.0..360.0).contains(&toc_amp)
+            && (tic_amp - toc_amp).abs() < 60.0
+        {
+            Some(self.lift_angle * (amps[0] + amps[1]) / 2.0)
+        } else {
+            None
+        }
     }
 
     /// Exponential-decay peak smoother, ported from tg's smooth().
