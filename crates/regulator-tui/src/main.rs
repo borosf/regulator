@@ -12,7 +12,7 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use regulator_core::{Analyzer, SyntheticWatch, TimingResult};
+use regulator_core::{CalStatus, CalibrationState, Analyzer, SyntheticWatch, TimingResult};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,6 +51,7 @@ fn build_analyzer(settings: &Settings) -> Analyzer {
     an.bph = settings.bph;
     an.lift_angle = settings.lift_angle;
     an.noise_suppressor = settings.noise_suppressor;
+    an.calibration = settings.calibration;
     an
 }
 
@@ -92,16 +93,53 @@ fn spawn_live_worker(
     std::thread::spawn(move || {
         let block = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize;
         let mut buf: Vec<f32> = Vec::with_capacity(block * 2);
+        let mut ts: u64 = 0;
+        let mut cal_state = CalibrationState::new();
+        let mut cal_cooldown = 0u32;
         loop {
+            let mut fresh = 0usize;
             while let Ok(s) = rx.try_recv() {
                 buf.push(s);
+                fresh += 1;
                 if buf.len() > block * 2 {
                     buf.drain(..block);
                 }
             }
-            if buf.len() >= block {
-                let res = analyze_block(&buf[buf.len() - block..], &settings.lock().unwrap_or_else(|e| e.into_inner()).clone());
-                let _ = tx.send(res);
+            ts += fresh as u64;
+            let mut s = settings.lock().unwrap_or_else(|e| e.into_inner());
+            if s.calibrating {
+                if buf.len() >= block && cal_cooldown == 0 {
+                    let cal_an = Analyzer::for_calibration(SAMPLE_RATE);
+                    let window_start_ts = ts.saturating_sub(buf.len() as u64);
+                    match cal_state.add_block(&cal_an, &buf[buf.len() - block..], window_start_ts) {
+                        CalStatus::Done(cal) => {
+                            s.calibration = cal;
+                            s.calibrating = false;
+                            s.cal_progress = format!("{cal:+.1} s/d");
+                        }
+                        CalStatus::Failed => {
+                            s.calibrating = false;
+                            s.cal_progress = "failed".into();
+                        }
+                        CalStatus::Collecting { have, need } => {
+                            s.cal_progress = format!("{have}/{need} s");
+                        }
+                        CalStatus::Missed => {}
+                    }
+                    cal_cooldown = 10; // feed ~1 window per second
+                }
+                if cal_cooldown > 0 {
+                    cal_cooldown -= 1;
+                }
+                drop(s);
+                // Keep the last measurement on screen during calibration.
+            } else {
+                let snapshot = s.clone();
+                drop(s);
+                if buf.len() >= block {
+                    let res = analyze_block(&buf[buf.len() - block..], &snapshot);
+                    let _ = tx.send(res);
+                }
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -139,6 +177,7 @@ fn run_tui(
                         KeyCode::Char('+') | KeyCode::Char('=') => s.lift_angle += 1.0,
                         KeyCode::Char('-') => s.lift_angle -= 1.0,
                         KeyCode::Char('n') => s.noise_suppressor = !s.noise_suppressor,
+                        KeyCode::Char('c') => s.calibrating = !s.calibrating,
                         _ => {}
                     }
                 }

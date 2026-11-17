@@ -14,6 +14,9 @@ pub struct Settings {
     pub lift_angle: f64,
     pub noise_suppressor: bool,
     pub source: String,
+    pub calibrating: bool,
+    pub calibration: f64,
+    pub cal_progress: String,
 }
 
 impl Default for Settings {
@@ -23,6 +26,9 @@ impl Default for Settings {
             lift_angle: 52.0,
             noise_suppressor: true,
             source: String::new(),
+            calibrating: false,
+            calibration: 0.0,
+            cal_progress: String::new(),
         }
     }
 }
@@ -146,6 +152,13 @@ fn draw_waveform(f: &mut ratatui::Frame, area: Rect, res: &Option<TimingResult>)
 
 fn draw_status(f: &mut ratatui::Frame, area: Rect, s: &Settings) {
     let bph = if s.bph == 0 { "auto".into() } else { s.bph.to_string() };
+    let cal = if s.calibrating {
+        format!(" calibrating {}…", s.cal_progress)
+    } else if s.calibration != 0.0 {
+        format!(" cal:{:+.1} s/d", s.calibration)
+    } else {
+        String::new()
+    };
     let line = Line::from(vec![
         Span::styled(format!(" {} ", s.source), Style::default().bg(Color::DarkGray)),
         Span::raw(format!(
@@ -154,7 +167,7 @@ fn draw_status(f: &mut ratatui::Frame, area: Rect, s: &Settings) {
             if s.noise_suppressor { "on" } else { "off" }
         )),
         Span::styled(
-            "←→ bph  +/- lift  n noise  q quit",
+            "←→ bph  +/- lift  n noise  c calibrate  q quit",
             Style::default().fg(Color::DarkGray),
         ),
     ]);

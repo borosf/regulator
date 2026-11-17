@@ -12,10 +12,12 @@
 //!    the balance amplitude from the pulse widths.
 
 pub mod analyze;
+pub mod calibrate;
 pub mod filters;
 pub mod signal;
 pub mod stats;
 
 pub use analyze::{Analyzer, TimingResult};
+pub use calibrate::{CalStatus, CalibrationState, CAL_DATA_SIZE};
 pub use signal::SyntheticWatch;
 pub const FILTER_CUTOFF: f64 = 3000.0;

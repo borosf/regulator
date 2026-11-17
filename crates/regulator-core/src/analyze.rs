@@ -80,6 +80,9 @@ pub struct Analyzer {
     pub lift_angle: f64,
     /// Enable the impulsive-noise suppressor.
     pub noise_suppressor: bool,
+    /// Sound-card calibration in s/day (from CalibrationState); subtracted
+    /// from the measured rate.
+    pub calibration: f64,
     lpf: Biquad,
     fft: RefCell<FftCache>,
     last_sigma: Cell<f64>,
@@ -94,6 +97,7 @@ impl Analyzer {
             bph: 0,
             lift_angle: 52.0,
             noise_suppressor: true,
+            calibration: 0.0,
             lpf: Biquad::low_pass(crate::FILTER_CUTOFF / sample_rate as f64),
             fft: RefCell::new(FftCache::new()),
             last_sigma: Cell::new(0.0),
@@ -114,7 +118,7 @@ impl Analyzer {
 
         self.prepare_data(&mut s);
         let period = self.compute_period(&s, n)?;
-        let waveform = self.compute_waveform(&s, period, n);
+        let (waveform, _) = self.compute_waveform(&s, period, n);
         let (beat_error_ms, tic, toc) = match self.compute_beat_error(&waveform, period) {
             Some((be, tic, toc)) => (be, Some(tic), Some(toc)),
             None => (None, None, None),
@@ -132,7 +136,7 @@ impl Analyzer {
             snap_bph(detected_bph)
         };
         let nominal = 7200.0 * sr as f64 / bph;
-        let rate_sday = (nominal / period - 1.0) * 86400.0;
+        let rate_sday = (nominal / period - 1.0) * 86400.0 - self.calibration;
 
         Some(TimingResult {
             period,
@@ -146,8 +150,17 @@ impl Analyzer {
         })
     }
 
+    /// An analyzer configured for sound-card calibration against a quartz
+    /// watch ticking once per second (tg's 7200 bph nominal period).
+    pub fn for_calibration(sample_rate: u32) -> Self {
+        let mut an = Analyzer::new(sample_rate);
+        an.bph = 7200;
+        an.noise_suppressor = false;
+        an
+    }
+
     /// Rectify, low-pass, normalize and window the input.
-    fn prepare_data(&self, s: &mut Vec<f32>) {
+    pub(crate) fn prepare_data(&self, s: &mut Vec<f32>) {
         let n = s.len();
         let sr = self.sample_rate as usize;
         if self.noise_suppressor {
@@ -333,7 +346,7 @@ impl Analyzer {
     /// and averaging the per-cycle estimates, ported from tg's
     /// compute_period(). Unlike tg, the final estimate is refined with
     /// parabolic interpolation for sub-sample period resolution.
-    fn compute_period(&self, s: &[f32], n: usize) -> Option<f64> {
+    pub(crate) fn compute_period(&self, s: &[f32], n: usize) -> Option<f64> {
         let sr = self.sample_rate as usize;
         let ac = self.autocorrelate(s, n);
         let estimate = if self.bph != 0 {
@@ -396,7 +409,7 @@ impl Analyzer {
 
     /// Fold the rectified signal at `period` and average into a one-period
     /// waveform, ported from tg's compute_phase()/compute_waveform().
-    fn compute_waveform(&self, s: &[f32], period: f64, n: usize) -> Vec<f32> {
+    pub(crate) fn compute_waveform(&self, s: &[f32], period: f64, n: usize) -> (Vec<f32>, f64) {
         let count = period as usize;
         let mut wf = vec![0f64; count];
         let mut j = 0usize;
@@ -425,9 +438,9 @@ impl Analyzer {
         let binsize = 1 + n / wf_size;
         let mut bin = vec![0f32; binsize + 1];
         let mut wf2 = vec![0f32; wf_size];
-        let phase = phase.round() as usize;
+        let phase_shift = phase.round() as usize;
         for i in 0..wf_size {
-            let k = (i + phase) % wf_size;
+            let k = (i + phase_shift) % wf_size;
             let mut j = 0;
             loop {
                 let idx = k + j * wf_size;
@@ -450,7 +463,7 @@ impl Analyzer {
         for v in wf2.iter_mut() {
             *v -= nl;
         }
-        wf2
+        (wf2, phase)
     }
 
     /// Beat error: distance between the tic and toc peaks in the folded

@@ -6,7 +6,7 @@
 mod audio;
 
 use eframe::egui;
-use regulator_core::{Analyzer, SyntheticWatch, TimingResult};
+use regulator_core::{CalStatus, CalibrationState, Analyzer, SyntheticWatch, TimingResult};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,6 +20,9 @@ struct Params {
     lift_angle: f64,
     noise_suppressor: bool,
     demo: bool,
+    calibrating: bool,
+    calibration: f64,
+    cal_progress: String,
 }
 
 impl Default for Params {
@@ -29,6 +32,9 @@ impl Default for Params {
             lift_angle: 52.0,
             noise_suppressor: true,
             demo: true,
+            calibrating: false,
+            calibration: 0.0,
+            cal_progress: String::new(),
         }
     }
 }
@@ -46,7 +52,7 @@ impl RegulatorApp {
     fn new(ring: Option<Ring>) -> Self {
         let params = Arc::new(Mutex::new(Params::default()));
         let (tx, rx) = mpsc::channel::<Option<TimingResult>>();
-        let p = params.clone();
+        let params_arc = params.clone();
         std::thread::spawn(move || {
             let watch = SyntheticWatch {
                 bph: 28800,
@@ -57,13 +63,54 @@ impl RegulatorApp {
             let demo_samples = watch.generate(SAMPLE_RATE, 120.0);
             let block = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize;
             let mut start = 0usize;
+            let mut ts: u64 = 0;
+            let mut last_len = 0usize;
+            let mut cal_state = CalibrationState::new();
+            let mut cal_cooldown = 0u32;
             loop {
-                let p = p.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let mut p = params_arc.lock().unwrap_or_else(|e| e.into_inner());
+                if p.calibrating {
+                    if let Some(ring) = &ring {
+                        let buf = ring.lock().unwrap_or_else(|e| e.into_inner());
+                        ts += buf.len().saturating_sub(last_len) as u64;
+                        last_len = buf.len();
+                        if buf.len() >= block && cal_cooldown == 0 {
+                            let cal_an = Analyzer::for_calibration(SAMPLE_RATE);
+                            let window_start_ts = ts.saturating_sub(buf.len() as u64);
+                            match cal_state.add_block(&cal_an, &buf[buf.len() - block..], window_start_ts) {
+                                CalStatus::Done(cal) => {
+                                    p.calibration = cal;
+                                    p.calibrating = false;
+                                    p.cal_progress = format!("{cal:+.1} s/d");
+                                }
+                                CalStatus::Failed => {
+                                    p.calibrating = false;
+                                    p.cal_progress = "failed".into();
+                                }
+                                CalStatus::Collecting { have, need } => {
+                                    p.cal_progress = format!("{have}/{need} s");
+                                }
+                                CalStatus::Missed => {}
+                            }
+                            cal_cooldown = 5;
+                        }
+                    }
+                    if cal_cooldown > 0 {
+                        cal_cooldown -= 1;
+                    }
+                    drop(p);
+                    let _ = tx.send(None::<TimingResult>);
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+                drop(p);
+                let p2 = params_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let mut analyzer = Analyzer::new(SAMPLE_RATE);
-                analyzer.bph = p.bph;
-                analyzer.lift_angle = p.lift_angle;
-                analyzer.noise_suppressor = p.noise_suppressor;
-                let res = if p.demo {
+                analyzer.bph = p2.bph;
+                analyzer.lift_angle = p2.lift_angle;
+                analyzer.noise_suppressor = p2.noise_suppressor;
+                analyzer.calibration = p2.calibration;
+                let res = if p2.demo {
                     let end = (start + block).min(demo_samples.len());
                     let r = analyzer.analyze(&demo_samples[start..end]);
                     if end == demo_samples.len() {
@@ -129,6 +176,21 @@ impl eframe::App for RegulatorApp {
                     ui.label("source: microphone");
                 }
                 ui.checkbox(&mut p.demo, "demo mode");
+                ui.separator();
+                if p.calibrating {
+                    ui.label(format!("calibrating: {} (use a quartz watch, 1 tick/s, ~15 min)", p.cal_progress));
+                    if ui.button("stop calibration").clicked() {
+                        p.calibrating = false;
+                    }
+                } else {
+                    if ui.button("calibrate (quartz, ~15 min)").clicked() {
+                        p.calibrating = !p.demo; // calibration needs the mic
+                        p.cal_progress.clear();
+                    }
+                    if p.calibration != 0.0 {
+                        ui.label(format!("calibration: {:+.1} s/d", p.calibration));
+                    }
+                }
                 ui.separator();
                 ui.small("regulator — GPLv2\na fork of tg");
             });
