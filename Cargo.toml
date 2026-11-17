@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/regulator-core", "crates/regulator-tui", "crates/regulator-gui"]
+members = ["crates/regulator-core", "crates/regulator-gui"]
 
 [workspace.package]
 version = "0.1.0"
