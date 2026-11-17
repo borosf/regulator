@@ -58,7 +58,7 @@ impl RegulatorApp {
             let block = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize;
             let mut start = 0usize;
             loop {
-                let p = p.lock().unwrap().clone();
+                let p = p.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let mut analyzer = Analyzer::new(SAMPLE_RATE);
                 analyzer.bph = p.bph;
                 analyzer.lift_angle = p.lift_angle;
@@ -73,7 +73,7 @@ impl RegulatorApp {
                     }
                     r
                 } else if let Some(ring) = &ring {
-                    let buf = ring.lock().unwrap();
+                    let buf = ring.lock().unwrap_or_else(|e| e.into_inner());
                     if buf.len() >= block {
                         analyzer.analyze(&buf[buf.len() - block..])
                     } else {
@@ -103,7 +103,7 @@ impl eframe::App for RegulatorApp {
         egui::SidePanel::right("settings")
             .min_width(220.0)
             .show(ctx, |ui| {
-                let mut p = self.params.lock().unwrap();
+                let mut p = self.params.lock().unwrap_or_else(|e| e.into_inner());
                 ui.heading("Settings");
                 ui.separator();
                 ui.label("Beat rate");
@@ -222,7 +222,7 @@ fn main() -> anyhow::Result<()> {
                     std::thread::spawn(move || {
                         let block = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize;
                         while let Ok(s) = rx.recv() {
-                            let mut buf = r.lock().unwrap();
+                            let mut buf = r.lock().unwrap_or_else(|e| e.into_inner());
                             buf.push(s);
                             if buf.len() > block * 2 {
                                 buf.drain(..block);

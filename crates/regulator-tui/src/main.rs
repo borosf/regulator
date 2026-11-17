@@ -24,7 +24,7 @@ const BLOCK_SECONDS: f64 = 4.0;
 fn main() -> Result<()> {
     let demo = std::env::args().any(|a| a == "--demo");
     let settings = Arc::new(Mutex::new(Settings::default()));
-    settings.lock().unwrap().source = if demo { "demo" } else { "mic" }.into();
+    settings.lock().unwrap_or_else(|e| e.into_inner()).source = if demo { "demo" } else { "mic" }.into();
 
     let (result_tx, result_rx) = mpsc::channel::<Option<TimingResult>>();
 
@@ -71,7 +71,7 @@ fn spawn_demo_worker(tx: mpsc::Sender<Option<TimingResult>>, settings: Arc<Mutex
         let block = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize;
         loop {
             let end = (start + block).min(samples.len());
-            let res = analyze_block(&samples[start..end], &settings.lock().unwrap().clone());
+            let res = analyze_block(&samples[start..end], &settings.lock().unwrap_or_else(|e| e.into_inner()).clone());
             let _ = tx.send(res);
             if end == samples.len() {
                 start = 0;
@@ -100,7 +100,7 @@ fn spawn_live_worker(
                 }
             }
             if buf.len() >= block {
-                let res = analyze_block(&buf[buf.len() - block..], &settings.lock().unwrap().clone());
+                let res = analyze_block(&buf[buf.len() - block..], &settings.lock().unwrap_or_else(|e| e.into_inner()).clone());
                 let _ = tx.send(res);
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -123,7 +123,7 @@ fn run_tui(
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    let mut s = settings.lock().unwrap();
+                    let mut s = settings.lock().unwrap_or_else(|e| e.into_inner());
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Left | KeyCode::Right => {
@@ -148,7 +148,7 @@ fn run_tui(
             result = r;
         }
         if last_draw.elapsed() > Duration::from_millis(100) {
-            let s = settings.lock().unwrap().clone();
+            let s = settings.lock().unwrap_or_else(|e| e.into_inner()).clone();
             terminal.draw(|f| ui::draw(f, &result, &s))?;
             last_draw = Instant::now();
         }

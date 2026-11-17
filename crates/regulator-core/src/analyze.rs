@@ -252,15 +252,18 @@ impl Analyzer {
     /// is a real peak (rises above the local median, not part of a sustained
     /// plateau). Returns the index or None.
     fn peak_detector(buff: &[f32], a: usize, b: usize) -> Option<usize> {
+        if b <= a || b >= buff.len() {
+            return None;
+        }
         let (max, i_max) = vmax(buff, a, b + 1);
         if max <= 0.0 {
             return None;
         }
         let med = median(&mut buff[a..=b].to_vec());
-        if buff[a + 1..i_max].iter().all(|&v| v > med) {
+        if i_max > a + 1 && buff[a + 1..i_max].iter().all(|&v| v > med) {
             return None;
         }
-        if buff[i_max + 1..=b].iter().all(|&v| v > med) {
+        if i_max == b || buff[i_max + 1..=b].iter().all(|&v| v > med) {
             return None;
         }
         let mut cnt = 0;
@@ -579,5 +582,25 @@ impl Analyzer {
             r_av += u - w;
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peak_detector_degenerate_ranges() {
+        let v = vec![1.0, 5.0, 1.0];
+        assert_eq!(Analyzer::peak_detector(&v, 1, 1), None);
+        assert_eq!(Analyzer::peak_detector(&v, 2, 1), None);
+        assert_eq!(Analyzer::peak_detector(&v, 0, 3), None);
+        assert_eq!(Analyzer::peak_detector(&v, 0, 2), Some(1));
+    }
+
+    #[test]
+    fn peak_detector_rejects_edge_peak() {
+        let v = vec![1.0, 2.0, 5.0];
+        assert_eq!(Analyzer::peak_detector(&v, 0, 2), None);
     }
 }
