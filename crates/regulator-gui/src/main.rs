@@ -8,6 +8,7 @@ mod chart;
 mod sheet;
 
 use eframe::egui;
+use regulator_core::dsp2::V2Tracker;
 use regulator_core::{CalStatus, CalibrationState, Analyzer, SyntheticWatch, TimingResult};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -176,9 +177,14 @@ impl RegulatorApp {
             let block = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize;
             let mut start = 0usize;
             let mut win_start_s = 0.0f64;
-            let mut demo_total_s = 0.0f64;
             let mut last_event_s = 0.0f64;
             let mut trace: Vec<TracePoint> = Vec::new();
+            // Next-generation detection chain state.
+            let mut tracker = V2Tracker::new(SAMPLE_RATE);
+            let mut fed_until: u64 = 0;
+            let mut last_v2 = None;
+            // Absolute sample position of the demo signal (it loops).
+            let mut demo_pos: u64 = 0;
             let mut ts: u64 = 0;
             let mut last_len = 0usize;
             let mut cal_state = CalibrationState::new();
@@ -241,40 +247,90 @@ impl RegulatorApp {
                 // The demo signal drives the app only when no microphone
                 // capture is available, so the interface stays usable on any
                 // machine without a hardware toggle.
-                let res = if ring.is_none() {
+                // One window per iteration, from whichever source is
+                // live, with its absolute sample position.
+                let window: Option<(u64, Vec<f32>)> = if ring.is_none() {
                     let end = (start + block).min(demo_samples.len());
-                    let r = analyzer.analyze(&demo_samples[start..end]);
-                    win_start_s = demo_total_s;
-                    demo_total_s += (end - start) as f64 / SAMPLE_RATE as f64;
+                    let w = demo_samples[start..end].to_vec();
+                    let s = demo_pos;
+                    demo_pos += w.len() as u64;
                     if end == demo_samples.len() {
                         start = 0;
                     } else {
                         start = end;
                     }
-                    r
+                    Some((s, w))
                 } else if let Some(ring) = &ring {
-                    // Copy the window out under the lock (a fraction of a
-                    // millisecond), then analyze without holding it so the
-                    // capture relay never stalls.
-                    let window = {
-                        let buf = ring.lock().unwrap_or_else(|e| e.into_inner());
-                        if buf.data.len() >= block {
-                            Some((buf.total, buf.data[buf.data.len() - block..].to_vec()))
-                        } else {
-                            None
-                        }
-                    };
-                    match window {
-                        Some((total, w)) => {
-                            win_start_s = (total - block as u64) as f64 / SAMPLE_RATE as f64;
-                            analyzer.analyze(&w)
-                        }
-                        None => None,
+                    let buf = ring.lock().unwrap_or_else(|e| e.into_inner());
+                    if buf.data.len() >= block {
+                        Some((
+                            buf.total - block as u64,
+                            buf.data[buf.data.len() - block..].to_vec(),
+                        ))
+                    } else {
+                        None
                     }
                 } else {
                     None
                 };
-                if let Some(r) = &res {
+                let res = window.as_ref().and_then(|(_, w)| analyzer.analyze(w));
+                if let Some((s, _)) = &window {
+                    win_start_s = *s as f64 / SAMPLE_RATE as f64;
+                }
+
+                // v2 detection chain: fed the same, non-overlapping
+                // windows. When it locks, its template-matched events
+                // drive the trace (better localization at low noise, and
+                // it acquires on signals far too faint for the v1
+                // estimator, where its rate becomes the readout).
+                tracker.bph_hint = p2.bph;
+                tracker.calibration = p2.calibration;
+                if let Some((s, w)) = &window {
+                    if *s >= fed_until {
+                        let r2 = tracker.push_block(w, *s);
+                        fed_until = s + w.len() as u64;
+                        last_v2 = Some(r2);
+                    }
+                }
+                let use_v2_events = tracker.locked();
+                let combined: Option<TimingResult> = match &res {
+                    Some(r) => Some(r.clone()),
+                    None => match &last_v2 {
+                        Some(r2) if r2.locked => Some(TimingResult {
+                            period: r2.period,
+                            rate_sday: r2.rate_sday,
+                            beat_error_ms: None,
+                            amplitude_deg: None,
+                            sigma: 0.0,
+                            waveform: Vec::new(),
+                            bph: r2.bph,
+                            tic: None,
+                            events: Vec::new(),
+                        }),
+                        _ => None,
+                    },
+                };
+                if use_v2_events {
+                    if let Some(r2) = &last_v2 {
+                        let period_s = r2.period / SAMPLE_RATE as f64;
+                        for ev in &r2.events {
+                            let t = ev.t / SAMPLE_RATE as f64;
+                            if t <= last_event_s {
+                                continue;
+                            }
+                            last_event_s = t;
+                            let mut e = (ev.t % r2.period) / r2.period - 0.5;
+                            if e < -0.5 {
+                                e += 1.0;
+                            }
+                            trace.push(TracePoint {
+                                t,
+                                phase_ms: e * period_s * 1000.0,
+                                tic: ev.tic,
+                            });
+                        }
+                    }
+                } else if let Some(r) = &res {
                     let p0 = 7200.0 * SAMPLE_RATE as f64 / r.bph as f64;
                     for (ev, is_tic) in &r.events {
                         let t = win_start_s + ev / SAMPLE_RATE as f64;
@@ -292,16 +348,16 @@ impl RegulatorApp {
                             tic: *is_tic,
                         });
                     }
-                    while let Some(first) = trace.first() {
-                        if first.t < win_start_s - 120.0 {
-                            trace.remove(0);
-                        } else {
-                            break;
-                        }
+                }
+                while let Some(first) = trace.first() {
+                    if first.t < win_start_s - 120.0 {
+                        trace.remove(0);
+                    } else {
+                        break;
                     }
                 }
-                let _ = tx.send(Feed {
-                    result: res,
+                                let _ = tx.send(Feed {
+                    result: combined,
                     trace: trace.clone(),
                     cal: None,
                 });

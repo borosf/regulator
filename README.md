@@ -51,9 +51,11 @@ synthetic demo watch automatically.
 - `crates/regulator-core` — pure DSP: filters, FFT-based period
   detection, waveform folding, rate/amplitude/beat-error computation,
   quartz calibration. No I/O; unit-tested against a synthetic watch
-  generator. `src/dsp2.rs` is the draft next-generation detection chain
-  (matched filtering, coherent folded acquisition, PLL tracking) — see
-  [docs/dsp2-notes.md](docs/dsp2-notes.md) for the experiment log.
+  generator. `src/dsp2.rs` is the next-generation detection chain
+  (coherent folded acquisition, matched-filter tracking, regression
+  period refit) — it acquires on ticks far too faint for the classic
+  estimator; see [docs/dsp2-notes.md](docs/dsp2-notes.md) for the
+  benchmark and design notes.
 - `crates/regulator-gui` — the application (egui).
 - `examples/analyze_wav.rs` — analyze a WAV/MP3/M4A recording from the
   command line; `examples/bench_dsp2.rs` — old-vs-new detection benchmark.
