@@ -117,7 +117,7 @@ fn draw_waveform(f: &mut ratatui::Frame, area: Rect, res: &Option<TimingResult>)
         let v = wf[i.min(wf.len() - 1)] / max;
         let h = ((v.abs() * mid).ceil() as u16).clamp(1, inner.height);
         let y = if v >= 0.0 {
-            mid as u16 - h
+            (mid as u16).saturating_sub(h)
         } else {
             mid as u16
         };
