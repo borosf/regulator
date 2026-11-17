@@ -8,7 +8,7 @@ mod chart;
 mod sheet;
 
 use eframe::egui;
-use regulator_core::{CalStatus, CalibrationState, ClockCal, Analyzer, SyntheticWatch, TimingResult};
+use regulator_core::{CalStatus, CalibrationState, Analyzer, SyntheticWatch, TimingResult};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -46,13 +46,10 @@ struct Params {
     bph: u32,
     lift_angle: f64,
     noise_suppressor: bool,
-    demo: bool,
     calibrating: bool,
     calibration: f64,
     /// Calibration came from the passive clock estimate, not a quartz run.
     cal_auto: bool,
-    /// Live clock-calibration estimate and uncertainty while converging.
-    cal_live: Option<(f64, f64)>,
     cal_progress: String,
     /// Settings changed since the last save.
     dirty: bool,
@@ -121,11 +118,9 @@ impl Default for Params {
             bph: 0,
             lift_angle: 52.0,
             noise_suppressor: true,
-            demo: true,
             calibrating: false,
             calibration: 0.0,
             cal_auto: false,
-            cal_live: None,
             cal_progress: String::new(),
             dirty: false,
         }
@@ -157,16 +152,18 @@ struct RegulatorApp {
     trace: Vec<TracePoint>,
     cal: Option<CalView>,
     last_export: Option<String>,
+    /// Live microphone capture exists (false: demo signal fallback).
+    has_mic: bool,
     params: Arc<Mutex<Params>>,
     rx: mpsc::Receiver<Feed>,
 }
 
 impl RegulatorApp {
-    fn new(ring: Option<Ring>, clock_cal: Arc<Mutex<ClockCal>>) -> Self {
+    fn new(ring: Option<Ring>) -> Self {
         let params = Arc::new(Mutex::new(Params::load()));
         let (tx, rx) = mpsc::channel::<Feed>();
+        let has_mic = ring.is_some();
         let params_arc = params.clone();
-        let clock_cal = clock_cal;
         std::thread::spawn(move || {
             let watch = SyntheticWatch {
                 bph: 28800,
@@ -231,20 +228,6 @@ impl RegulatorApp {
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
-                // Passive clock calibration: apply once the sample-count
-                // regression has converged (unless a quartz calibration
-                // has set the value manually).
-                let cc_est = clock_cal.lock().unwrap_or_else(|e| e.into_inner()).estimate();
-                if let Some((err, unc)) = cc_est {
-                    // `p` is already held here; re-locking params would
-                    // deadlock (std Mutex is not reentrant). The clock
-                    // estimate is informational only: it measures the
-                    // sound card against the local timer, whose own
-                    // drift is unknown (tens of s/day on some hardware),
-                    // so it is never auto-applied. The quartz calibration
-                    // is the authoritative correction.
-                    p.cal_live = Some((err, unc));
-                }
                 if p.dirty {
                     p.save();
                     p.dirty = false;
@@ -255,7 +238,10 @@ impl RegulatorApp {
                 analyzer.lift_angle = p2.lift_angle;
                 analyzer.noise_suppressor = p2.noise_suppressor;
                 analyzer.calibration = p2.calibration;
-                let res = if p2.demo {
+                // The demo signal drives the app only when no microphone
+                // capture is available, so the interface stays usable on any
+                // machine without a hardware toggle.
+                let res = if ring.is_none() {
                     let end = (start + block).min(demo_samples.len());
                     let r = analyzer.analyze(&demo_samples[start..end]);
                     win_start_s = demo_total_s;
@@ -327,6 +313,7 @@ impl RegulatorApp {
             trace: Vec::new(),
             cal: None,
             last_export: None,
+            has_mic,
             params,
             rx,
         }
@@ -389,9 +376,12 @@ impl eframe::App for RegulatorApp {
                     ui.label(
                         egui::RichText::new(format!(
                             "{}  {}",
-                            if p.demo { "demo" } else { "mic" },
+                            if self.has_mic { "mic" } else { "demo" },
                             match p.bph {
-                                0 => "auto".to_string(),
+                                0 => match self.result.as_ref().map(|r| r.bph) {
+                                    Some(b) => format!("auto (detected {b} bph)"),
+                                    None => "auto".to_string(),
+                                },
                                 b => format!("{b} bph"),
                             }
                         ))
@@ -417,14 +407,6 @@ impl eframe::App for RegulatorApp {
                 if p.calibration != 0.0 {
                     let tag = if p.cal_auto { " auto" } else { "" };
                     strip_value(ui, "cal", &Some(format!("{:+.1} s/d{tag}", p.calibration)));
-                } else if let Some((err, unc)) = p.cal_live {
-                    ui.label(
-                        egui::RichText::new(format!("clock {err:+.1} ±{unc:.1}"))
-                            .monospace()
-                            .size(14.0)
-                            .color(egui::Color32::from_gray(140)),
-                    );
-                    ui.add_space(12.0);
                 }
                 if p.calibrating {
                     ui.label(
@@ -446,7 +428,7 @@ impl eframe::App for RegulatorApp {
                 ui.add_space(6.0);
                 ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
                 let mut p = self.params.lock().unwrap_or_else(|e| e.into_inner());
-                let before = (p.bph, p.lift_angle, p.calibration, p.noise_suppressor, p.demo);
+                let before = (p.bph, p.lift_angle, p.calibration, p.noise_suppressor);
                 ui.label(egui::RichText::new("BEAT RATE").small().weak());
                 egui::ComboBox::from_id_salt("bph")
                     .selected_text(if p.bph == 0 { "auto".into() } else { p.bph.to_string() })
@@ -470,7 +452,6 @@ impl eframe::App for RegulatorApp {
                 );
                 ui.add_space(6.0);
                 ui.checkbox(&mut p.noise_suppressor, "noise suppressor");
-                ui.checkbox(&mut p.demo, "demo signal");
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("CALIBRATION s/d").small().weak());
                 ui.add(
@@ -484,12 +465,11 @@ impl eframe::App for RegulatorApp {
                         p.calibrating = false;
                     }
                 } else if ui.button("calibrate (quartz)").clicked() {
-                    p.demo = false;
                     p.calibrating = true;
                     p.cal_progress.clear();
                 }
                 ui.add_space(10.0);
-                let after = (p.bph, p.lift_angle, p.calibration, p.noise_suppressor, p.demo);
+                let after = (p.bph, p.lift_angle, p.calibration, p.noise_suppressor);
                 if after != before {
                     p.dirty = true;
                 }
@@ -607,11 +587,8 @@ fn draw_waveform(ui: &mut egui::Ui, result: &Option<TimingResult>, height: f32) 
 }
 
 fn main() -> anyhow::Result<()> {
-    let clock_cal: Arc<Mutex<ClockCal>> = Arc::new(Mutex::new(ClockCal::new(SAMPLE_RATE)));
-
     // Live capture (if built with the audio feature); a relay thread moves
-    // samples into a shared ring buffer the worker reads, feeding the
-    // clock calibration as it goes.
+    // samples into a shared ring buffer the worker reads.
     let ring: Option<Ring> = {
         #[cfg(feature = "audio")]
         {
@@ -620,17 +597,10 @@ fn main() -> anyhow::Result<()> {
                 Ok(()) => {
                     let ring: Ring = Arc::new(Mutex::new(MicBuf { data: Vec::new(), total: 0 }));
                     let r = ring.clone();
-                    let cc = clock_cal.clone();
                     std::thread::spawn(move || {
                         let cap = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize * 2;
-                        let mut batch = 0usize;
                         while let Ok(s) = rx.recv() {
                             r.lock().unwrap_or_else(|e| e.into_inner()).push(s, cap);
-                            batch += 1;
-                            if batch >= 2048 {
-                                cc.lock().unwrap_or_else(|e| e.into_inner()).add(batch);
-                                batch = 0;
-                            }
                         }
                     });
                     Some(ring)
@@ -656,7 +626,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "regulator",
         native,
-        Box::new(move |_cc| Ok(Box::new(RegulatorApp::new(ring, clock_cal)))),
+        Box::new(move |_cc| Ok(Box::new(RegulatorApp::new(ring)))),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }

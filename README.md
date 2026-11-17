@@ -82,9 +82,6 @@ for the original project's documentation.
 
 ## Known limitations
 
-- The passive clock estimate (sound card vs. local timer) is
-  informational only: many machines' timers drift by tens of s/day, so
-  only the quartz calibration is applied to measurements.
 - Tick events are located by peak search around expected positions, not
   template matching; very noisy recordings may drop events.
 
