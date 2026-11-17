@@ -11,6 +11,22 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// One located tick event on the live trace.
+#[derive(Clone, Copy)]
+struct TracePoint {
+    /// Absolute time in seconds.
+    t: f64,
+    /// Phase error against the nominal beat grid, in milliseconds.
+    phase_ms: f64,
+    tic: bool,
+}
+
+/// What the worker sends to the UI each iteration.
+struct Feed {
+    result: Option<TimingResult>,
+    trace: Vec<TracePoint>,
+}
+
 const SAMPLE_RATE: u32 = 44100;
 const BLOCK_SECONDS: f64 = 4.0;
 
@@ -44,14 +60,15 @@ type Ring = Arc<Mutex<Vec<f32>>>;
 
 struct RegulatorApp {
     result: Option<TimingResult>,
+    trace: Vec<TracePoint>,
     params: Arc<Mutex<Params>>,
-    rx: mpsc::Receiver<Option<TimingResult>>,
+    rx: mpsc::Receiver<Feed>,
 }
 
 impl RegulatorApp {
     fn new(ring: Option<Ring>) -> Self {
         let params = Arc::new(Mutex::new(Params::default()));
-        let (tx, rx) = mpsc::channel::<Option<TimingResult>>();
+        let (tx, rx) = mpsc::channel::<Feed>();
         let params_arc = params.clone();
         std::thread::spawn(move || {
             let watch = SyntheticWatch {
@@ -64,6 +81,9 @@ impl RegulatorApp {
             let demo_samples = watch.generate(SAMPLE_RATE, 120.0);
             let block = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize;
             let mut start = 0usize;
+            let mut win_start_s = 0.0f64;
+            let mut last_event_s = 0.0f64;
+            let mut trace: Vec<TracePoint> = Vec::new();
             let mut ts: u64 = 0;
             let mut last_len = 0usize;
             let mut cal_state = CalibrationState::new();
@@ -100,7 +120,7 @@ impl RegulatorApp {
                         cal_cooldown -= 1;
                     }
                     drop(p);
-                    let _ = tx.send(None::<TimingResult>);
+                    let _ = tx.send(Feed { result: None, trace: trace.clone() });
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
@@ -114,6 +134,7 @@ impl RegulatorApp {
                 let res = if p2.demo {
                     let end = (start + block).min(demo_samples.len());
                     let r = analyzer.analyze(&demo_samples[start..end]);
+                    win_start_s = start as f64 / SAMPLE_RATE as f64;
                     if end == demo_samples.len() {
                         start = 0;
                     } else {
@@ -123,6 +144,7 @@ impl RegulatorApp {
                 } else if let Some(ring) = &ring {
                     let buf = ring.lock().unwrap_or_else(|e| e.into_inner());
                     if buf.len() >= block {
+                        win_start_s = (buf.len() - block) as f64 / SAMPLE_RATE as f64;
                         analyzer.analyze(&buf[buf.len() - block..])
                     } else {
                         None
@@ -130,12 +152,42 @@ impl RegulatorApp {
                 } else {
                     None
                 };
-                let _ = tx.send(res);
+                if let Some(r) = &res {
+                    let p0 = 7200.0 * SAMPLE_RATE as f64 / r.bph as f64;
+                    for (ev, is_tic) in &r.events {
+                        let t = win_start_s + ev / SAMPLE_RATE as f64;
+                        if t <= last_event_s {
+                            continue;
+                        }
+                        last_event_s = t;
+                        let mut e = (ev % p0) / p0 - 0.5;
+                        if e < -0.5 {
+                            e += 1.0;
+                        }
+                        trace.push(TracePoint {
+                            t,
+                            phase_ms: e * (2.0 * 3600.0 / r.bph as f64) * 1000.0,
+                            tic: *is_tic,
+                        });
+                    }
+                    while let Some(first) = trace.first() {
+                        if first.t < win_start_s - 120.0 {
+                            trace.remove(0);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let _ = tx.send(Feed {
+                    result: res,
+                    trace: trace.clone(),
+                });
                 std::thread::sleep(Duration::from_millis(200));
             }
         });
         Self {
             result: None,
+            trace: Vec::new(),
             params,
             rx,
         }
@@ -144,8 +196,9 @@ impl RegulatorApp {
 
 impl eframe::App for RegulatorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        while let Ok(r) = self.rx.try_recv() {
-            self.result = r;
+        while let Ok(feed) = self.rx.try_recv() {
+            self.result = feed.result;
+            self.trace = feed.trace;
         }
 
         egui::SidePanel::right("settings")
@@ -179,12 +232,12 @@ impl eframe::App for RegulatorApp {
                 ui.checkbox(&mut p.demo, "demo mode");
                 ui.separator();
                 if p.calibrating {
-                    ui.label(format!("calibrating: {} (use a quartz watch, 1 tick/s, ~15 min)", p.cal_progress));
+                    ui.label(format!("calibrating: {} (quartz watch, 1 tick/s; refits every second, stops when confident)", p.cal_progress));
                     if ui.button("stop calibration").clicked() {
                         p.calibrating = false;
                     }
                 } else {
-                    if ui.button("calibrate (quartz, ~15 min)").clicked() {
+                    if ui.button("calibrate (quartz, exits early)").clicked() {
                         p.calibrating = !p.demo; // calibration needs the mic
                         p.cal_progress.clear();
                     }
@@ -221,10 +274,48 @@ impl eframe::App for RegulatorApp {
                 );
             });
             ui.separator();
-            draw_waveform(ui, &self.result);
+            let wave_h = ui.available_size().y * 0.42;
+            draw_waveform(ui, &self.result, wave_h);
+            ui.separator();
+            ui.label("Trace");
+            draw_trace(ui, &self.trace);
         });
 
         ctx.request_repaint_after(Duration::from_millis(200));
+    }
+}
+
+/// The tick-event trace: each event plotted at its phase error over time.
+/// A rate error shows as drifting diagonal bands, beat error as two
+/// separated bands, noise as scatter - the classic timing-machine display.
+fn draw_trace(ui: &mut egui::Ui, trace: &[TracePoint]) {
+    let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
+    painter.rect_filled(resp.rect, 4.0, egui::Color32::from_gray(16));
+    if trace.is_empty() {
+        return;
+    }
+    let rect = resp.rect;
+    let t_end = trace.last().map(|p| p.t).unwrap_or(0.0);
+    let t_start = (t_end - 60.0).max(0.0);
+    // Vertical scale: half the beat period, so tic and toc bands both fit.
+    let half_ms = 1000.0 * 3600.0 / 14400.0;
+    let to_x = |t: f64| rect.left() + (((t - t_start) / 60.0).clamp(0.0, 1.0) * rect.width() as f64) as f32;
+    let to_y = |ms: f64| {
+        let k = (ms / half_ms).clamp(-1.0, 1.0) as f32;
+        rect.center().y - k * (rect.height() / 2.0 - 3.0)
+    };
+    // Center line: the nominal beat grid.
+    painter.line_segment(
+        [rect.left_top() + egui::vec2(0.0, rect.height() / 2.0), rect.right_top() + egui::vec2(0.0, rect.height() / 2.0)],
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(48)),
+    );
+    for p in trace.iter().filter(|p| p.t >= t_start) {
+        let color = if p.tic {
+            egui::Color32::LIGHT_GREEN
+        } else {
+            egui::Color32::from_rgb(255, 120, 255)
+        };
+        painter.circle_filled(egui::pos2(to_x(p.t), to_y(p.phase_ms)), 1.5_f32, color);
     }
 }
 
@@ -239,8 +330,9 @@ fn big_metric(ui: &mut egui::Ui, name: &str, value: &Option<f64>, unit: &str, de
     });
 }
 
-fn draw_waveform(ui: &mut egui::Ui, result: &Option<TimingResult>) {
-    let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
+fn draw_waveform(ui: &mut egui::Ui, result: &Option<TimingResult>, height: f32) {
+    let size = egui::vec2(ui.available_size().x, height);
+    let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
     painter.rect_filled(resp.rect, 4.0, egui::Color32::from_gray(16));
     let Some(r) = result else { return };
     let wf = &r.waveform;

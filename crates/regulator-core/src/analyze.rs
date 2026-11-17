@@ -30,6 +30,9 @@ pub struct TimingResult {
     pub bph: u32,
     /// Position of the tic peak in the folded waveform, if found.
     pub tic: Option<usize>,
+    /// Located tick events in this block: (sample position, is_tic).
+    /// Sample positions are fractional and relative to the block start.
+    pub events: Vec<(f64, bool)>,
 }
 
 struct FftCache {
@@ -120,7 +123,7 @@ impl Analyzer {
 
         self.prepare_data(&mut s);
         let period = self.compute_period(&s, n)?;
-        let (waveform, _) = self.compute_waveform(&s, period, n);
+        let (waveform, _, phase_shift) = self.compute_waveform(&s, period, n);
         let (beat_error_ms, tic, toc) = match self.compute_beat_error(&waveform, period) {
             Some((be, tic, toc)) => (be, Some(tic), Some(toc)),
             None => (None, None, None),
@@ -130,6 +133,28 @@ impl Analyzer {
             (Some(tic), Some(toc)) => self.compute_amplitude(&waveform, period, tic, toc),
             _ => None,
         };
+
+        // Locate individual tick events by extrapolating the tic/toc peaks
+        // through the block at the detected period (a light-weight version
+        // of tg's locate_events, which cross-correlates a template).
+        let mut events = Vec::new();
+        if let (Some(tic), Some(toc)) = (tic, toc) {
+            let wf_size = waveform.len().max(1);
+            let tic0 = (tic + phase_shift) as f64;
+            let toc0 = (toc + phase_shift) as f64;
+            let cycles = (n as f64 / period).ceil() as usize + 1;
+            for k in 0..cycles {
+                let t = tic0 + k as f64 * period;
+                if t >= 0.0 && t < n as f64 {
+                    events.push((t, true));
+                }
+                let t = toc0 + k as f64 * period;
+                if t >= 0.0 && t < n as f64 {
+                    events.push((t, false));
+                }
+            }
+            let _ = wf_size;
+        }
 
         let detected_bph = 2.0 * 3600.0 * sr as f64 / period;
         let bph = if self.bph != 0 {
@@ -149,6 +174,7 @@ impl Analyzer {
             waveform,
             bph: bph as u32,
             tic: tic_idx,
+            events,
         })
     }
 
@@ -412,7 +438,7 @@ impl Analyzer {
 
     /// Fold the rectified signal at `period` and average into a one-period
     /// waveform, ported from tg's compute_phase()/compute_waveform().
-    pub(crate) fn compute_waveform(&self, s: &[f32], period: f64, n: usize) -> (Vec<f32>, f64) {
+    pub(crate) fn compute_waveform(&self, s: &[f32], period: f64, n: usize) -> (Vec<f32>, f64, usize) {
         let count = period as usize;
         let mut wf = vec![0f64; count];
         let mut j = 0usize;
@@ -466,7 +492,7 @@ impl Analyzer {
         for v in wf2.iter_mut() {
             *v -= nl;
         }
-        (wf2, phase)
+        (wf2, phase, phase_shift)
     }
 
     /// Beat error: distance between the tic and toc peaks in the folded

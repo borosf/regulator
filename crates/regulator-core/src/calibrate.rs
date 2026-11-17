@@ -81,7 +81,7 @@ impl CalibrationState {
             Some(p) => p,
             None => return CalStatus::Missed,
         };
-        let (wf, phase) = an.compute_waveform(&s, period, n);
+        let (wf, phase, _) = an.compute_waveform(&s, period, n);
 
         // Lock check: the tick must sit near the middle of the folded window.
         let wf_max = wf.iter().cloned().fold(0f32, f32::max);
@@ -114,18 +114,21 @@ impl CalibrationState {
             self.points.push((time, phase_tick));
         }
 
-        if self.points.len() >= self.need {
-            match Self::fit(&self.points) {
-                Ok(cal) => {
-                    self.cal = Some(cal);
-                    CalStatus::Done(cal)
-                }
-                Err(_) => CalStatus::Failed,
+        // Try to finish early: once enough points have been collected,
+        // refit on every new sample and stop as soon as the confidence
+        // interval is tight enough (tg always waits for all 900 points).
+        let min_points = self.need.min(60);
+        if self.points.len() >= min_points {
+            if let Ok(cal) = Self::fit(&self.points) {
+                self.cal = Some(cal);
+                return CalStatus::Done(cal);
             }
-        } else {
-            let have = self.points.len();
-            CalStatus::Collecting { have, need: self.need }
+            if self.points.len() >= self.need {
+                return CalStatus::Failed;
+            }
         }
+        let have = self.points.len();
+        CalStatus::Collecting { have, need: self.need }
     }
 
     /// tg's compute_cal: unwrap the circular phases around their mean

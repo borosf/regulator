@@ -31,7 +31,7 @@ fn main() {
         }
         match analyzer.analyze(chunk) {
             Some(r) => println!(
-                "t={t:6.1}s  rate={:+8.1} s/d  amp={:>5}  be={:+6.2} ms  period={:.1} bph={}",
+                "t={t:6.1}s  rate={:+8.1} s/d  amp={:>5}  be={:+6.2} ms  period={:.1} bph={}  events={}",
                 r.rate_sday.unwrap_or(f64::NAN),
                 r.amplitude_deg
                     .map(|a| format!("{a:.0}"))
@@ -39,6 +39,7 @@ fn main() {
                 r.beat_error_ms.unwrap_or(f64::NAN),
                 r.period,
                 r.bph,
+                r.events.len(),
             ),
             None => println!("t={t:6.1}s  no signal"),
         }
