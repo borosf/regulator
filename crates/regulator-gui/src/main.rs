@@ -4,6 +4,7 @@
 
 #[cfg(feature = "audio")]
 mod audio;
+mod chart;
 
 use eframe::egui;
 use regulator_core::{CalStatus, CalibrationState, Analyzer, SyntheticWatch, TimingResult};
@@ -21,10 +22,19 @@ struct TracePoint {
     tic: bool,
 }
 
+/// Live calibration feedback for the center panel.
+struct CalView {
+    points: Vec<(f64, f64)>,
+    have: usize,
+    need: usize,
+    estimate: Option<(f64, f64)>,
+}
+
 /// What the worker sends to the UI each iteration.
 struct Feed {
     result: Option<TimingResult>,
     trace: Vec<TracePoint>,
+    cal: Option<CalView>,
 }
 
 const SAMPLE_RATE: u32 = 44100;
@@ -61,6 +71,8 @@ type Ring = Arc<Mutex<Vec<f32>>>;
 struct RegulatorApp {
     result: Option<TimingResult>,
     trace: Vec<TracePoint>,
+    cal: Option<CalView>,
+    last_export: Option<String>,
     params: Arc<Mutex<Params>>,
     rx: mpsc::Receiver<Feed>,
 }
@@ -119,8 +131,14 @@ impl RegulatorApp {
                     if cal_cooldown > 0 {
                         cal_cooldown -= 1;
                     }
+                    let view = CalView {
+                        points: cal_state.points().to_vec(),
+                        have: cal_state.progress().0,
+                        need: cal_state.progress().1,
+                        estimate: cal_state.estimate(),
+                    };
                     drop(p);
-                    let _ = tx.send(Feed { result: None, trace: trace.clone() });
+                    let _ = tx.send(Feed { result: None, trace: Vec::new(), cal: Some(view) });
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
@@ -181,6 +199,7 @@ impl RegulatorApp {
                 let _ = tx.send(Feed {
                     result: res,
                     trace: trace.clone(),
+                    cal: None,
                 });
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -188,6 +207,8 @@ impl RegulatorApp {
         Self {
             result: None,
             trace: Vec::new(),
+            cal: None,
+            last_export: None,
             params,
             rx,
         }
@@ -199,6 +220,11 @@ impl eframe::App for RegulatorApp {
         while let Ok(feed) = self.rx.try_recv() {
             self.result = feed.result;
             self.trace = feed.trace;
+            if feed.cal.is_some() {
+                self.cal = feed.cal;
+            } else {
+                self.cal = None;
+            }
         }
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = egui::Color32::from_rgb(14, 16, 18);
@@ -296,8 +322,13 @@ impl eframe::App for RegulatorApp {
                         }
                     });
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new(format!("LIFT ANGLE  {:.0}°", p.lift_angle)).small().weak());
-                ui.add(egui::Slider::new(&mut p.lift_angle, 40.0..=60.0).show_value(false));
+                ui.label(egui::RichText::new("LIFT ANGLE").small().weak());
+                ui.add(
+                    egui::DragValue::new(&mut p.lift_angle)
+                        .range(30.0..=70.0)
+                        .speed(0.5)
+                        .suffix("°"),
+                );
                 ui.add_space(6.0);
                 ui.checkbox(&mut p.noise_suppressor, "noise suppressor");
                 ui.checkbox(&mut p.demo, "demo signal");
@@ -307,7 +338,8 @@ impl eframe::App for RegulatorApp {
                         p.calibrating = false;
                     }
                 } else if ui.button("calibrate (quartz)").clicked() {
-                    p.calibrating = !p.demo;
+                    p.demo = false;
+                    p.calibrating = true;
                     p.cal_progress.clear();
                 }
                 ui.add_space(10.0);
@@ -315,23 +347,38 @@ impl eframe::App for RegulatorApp {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("WAVEFORM").small().weak());
                 draw_waveform(ui, &self.result, 90.0);
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.label(
-                        egui::RichText::new("regulator — GPLv2")
-                            .monospace()
-                            .size(11.0)
-                            .color(egui::Color32::from_gray(90)),
-                    );
-                });
             });
 
-        // Center: the strip chart. Time flows downward, newest ticks at the
-        // bottom; horizontal axis is the phase error against the beat grid.
+        // Center: the strip chart, or live calibration feedback while
+        // calibrating.
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::from_rgb(10, 11, 12)))
             .show(ctx, |ui| {
-                draw_trace(ui, &self.trace);
+                if let Some(cal) = &self.cal {
+                    chart::draw_cal_view(ui, cal);
+                } else {
+                    draw_trace(ui, &self.trace);
+                }
             });
+
+        // Export needs the trace; run it from a small panel-level button on
+        // the top bar, right side.
+        egui::TopBottomPanel::top("export").show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                if ui.button("export chart").clicked() {
+                    self.last_export = chart::export_chart(&self.trace, &self.result, &self.params);
+                }
+                if let Some(path) = &self.last_export {
+                    ui.label(
+                        egui::RichText::new(format!("saved {path}"))
+                            .monospace()
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(120, 220, 120)),
+                    );
+                }
+            });
+        });
 
         ctx.request_repaint_after(Duration::from_millis(200));
     }

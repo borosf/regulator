@@ -56,6 +56,17 @@ impl CalibrationState {
         self.cal
     }
 
+    /// The (time, phase) samples collected so far, for live feedback.
+    pub fn points(&self) -> &[(f64, f64)] {
+        &self.points
+    }
+
+    /// The current best-fit calibration and its standard error in s/day,
+    /// even if the quality gate has not been met yet.
+    pub fn estimate(&self) -> Option<(f64, f64)> {
+        Self::fit_with_delta(&self.points).ok()
+    }
+
     /// Progress: (collected, needed).
     pub fn progress(&self) -> (usize, usize) {
         (self.points.len(), self.need)
@@ -135,6 +146,14 @@ impl CalibrationState {
     /// direction, then least-squares fit the drift; the slope in s/d is the
     /// sound card's apparent rate error.
     fn fit(points: &[(f64, f64)]) -> Result<f64, ()> {
+        let (cal, delta) = Self::fit_with_delta(points)?;
+        if delta >= 0.1 {
+            return Err(());
+        }
+        Ok(cal)
+    }
+
+    fn fit_with_delta(points: &[(f64, f64)]) -> Result<(f64, f64), ()> {
         let n = points.len();
         if n < 3 {
             return Err(());
@@ -165,10 +184,7 @@ impl CalibrationState {
         }
         let calibration = xy * 3600.0 * 24.0 / xx;
         let delta = ((xx * yy - xy * xy) / (n as f64 - 2.0)).sqrt() / xx;
-        if delta * 3600.0 * 24.0 >= 0.1 {
-            return Err(());
-        }
-        Ok(calibration)
+        Ok((calibration, delta * 3600.0 * 24.0))
     }
 }
 
