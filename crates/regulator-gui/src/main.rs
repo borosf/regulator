@@ -235,11 +235,14 @@ impl RegulatorApp {
                             cal_fed_until = start_u64 + w.len() as u64;
                             match cal_state.add_block(&cal_an, &w, window_start_ts) {
                                 CalStatus::Done(cal) => {
-                                    p.calibration = cal;
+                                    // The quartz fit reports the raw error of
+                                    // a perfect watch; tg's convention (which
+                                    // the analyzer applies) needs its negation.
+                                    p.calibration = -cal;
                                     p.calibrating = false;
                                     p.cal_auto = true;
                                     p.dirty = true;
-                                    p.cal_progress = format!("{cal:+.1} s/d");
+                                    p.cal_progress = format!("{:+.1} s/d", -cal);
                                 }
                                 CalStatus::Failed => {
                                     p.calibrating = false;

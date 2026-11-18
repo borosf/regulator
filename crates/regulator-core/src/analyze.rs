@@ -101,8 +101,8 @@ pub struct Analyzer {
     pub lift_angle: f64,
     /// Enable the impulsive-noise suppressor.
     pub noise_suppressor: bool,
-    /// Sound-card calibration in s/day (from CalibrationState); subtracted
-    /// from the measured rate.
+    /// Sound-card calibration in s/day, in tg's sign convention; added to
+    /// the measured rate (a tg value transfers over 1:1).
     pub calibration: f64,
     lpf: Biquad,
     hpf: Biquad,
@@ -199,7 +199,7 @@ impl Analyzer {
             snap_bph(detected_bph)
         };
         let nominal = 7200.0 * sr as f64 / bph;
-        let rate_sday = (nominal / period - 1.0) * 86400.0 - self.calibration;
+        let rate_sday = (nominal / period - 1.0) * 86400.0 + self.calibration;
 
         Some(TimingResult {
             period,
