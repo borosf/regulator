@@ -30,6 +30,8 @@ pub struct TimingResult {
     pub bph: u32,
     /// Position of the tic peak in the folded waveform, if found.
     pub tic: Option<usize>,
+    /// Position of the toc peak in the folded waveform, if found.
+    pub toc: Option<usize>,
     /// Located tick events in this block: (sample position, is_tic).
     /// Sample positions are fractional and relative to the block start.
     pub events: Vec<(f64, bool)>,
@@ -210,6 +212,7 @@ impl Analyzer {
             waveform,
             bph: bph as u32,
             tic: tic_idx,
+            toc,
             events,
         })
     }

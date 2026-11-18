@@ -422,6 +422,7 @@ impl RegulatorApp {
                             waveform: Vec::new(),
                             bph: r2.bph,
                             tic: None,
+                            toc: None,
                             events: Vec::new(),
                         }),
                         _ => None,
@@ -560,8 +561,15 @@ impl eframe::App for RegulatorApp {
             }
         }
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(14, 16, 18);
-        visuals.window_fill = egui::Color32::from_rgb(14, 16, 18);
+        visuals.panel_fill = egui::Color32::from_rgb(12, 13, 15);
+        visuals.window_fill = egui::Color32::from_rgb(12, 13, 15);
+        visuals.extreme_bg_color = egui::Color32::from_rgb(8, 9, 10);
+        visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(18, 20, 22);
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(22, 24, 27);
+        visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+        visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+        visuals.widgets.active.corner_radius = egui::CornerRadius::same(4);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(40, 60, 48);
         ctx.set_visuals(visuals);
 
         // Top: the primary readout. One number the watchmaker stares at,
@@ -747,28 +755,74 @@ impl eframe::App for RegulatorApp {
                 }
                 ui.separator();
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("WAVEFORM").small().weak());
-                draw_waveform(ui, &self.result, 90.0);
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("RATE TREND (5 min)").small().weak());
+                ui.label(egui::RichText::new("RATE TREND (5 MIN)").small().weak());
                 draw_trend(ui, &self.history, 110.0);
                 ui.add_space(6.0);
                 ui.checkbox(&mut self.held, "hold (space)");
             });
 
-        // Center: the strip chart, or live calibration feedback while
-        // calibrating.
+        // Center: the strip chart on top, tg's tick scope views beneath —
+        // live calibration feedback takes over while calibrating.
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::from_rgb(10, 11, 12)))
             .show(ctx, |ui| {
+                ui.add_space(6.0);
                 if let Some(cal) = &self.cal {
                     chart::draw_cal_view(ui, cal);
-                } else if self.trace.is_empty() {
-                    draw_listening(ui, self.mic_live);
                 } else {
-                    draw_trace(ui, &self.trace);
+                    let avail = ui.available_size();
+                    let scopes = self
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.tic.map(|tic| (r, tic)))
+                        .filter(|(r, _)| r.waveform.iter().cloned().fold(0f32, f32::max) > 0.0);
+                    let scope_h = match scopes {
+                        Some((r, _)) if r.toc.is_some() => 300.0,
+                        Some(_) => 150.0,
+                        None => 0.0,
+                    };
+                    if avail.y > scope_h + 80.0 {
+                        if self.trace.is_empty() {
+                            draw_listening(ui, self.mic_live, avail.y - scope_h);
+                        } else {
+                            draw_trace(ui, &self.trace, avail.y - scope_h);
+                        }
+                        if let Some((r, tic)) = scopes {
+                            let lift = self
+                                .params
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .lift_angle;
+                            let h = 144.0;
+                            draw_scope(
+                                ui,
+                                &r.waveform,
+                                tic,
+                                "TIC",
+                                egui::Color32::WHITE,
+                                r.period,
+                                lift,
+                                h,
+                            );
+                            ui.add_space(6.0);
+                            if let Some(toc) = r.toc {
+                                draw_scope(
+                                    ui,
+                                    &r.waveform,
+                                    toc,
+                                    "TOC",
+                                    egui::Color32::from_rgb(235, 200, 90),
+                                    r.period,
+                                    lift,
+                                    h,
+                                );
+                            }
+                        }
+                    } else if self.trace.is_empty() {
+                        draw_listening(ui, self.mic_live, avail.y);
+                    } else {
+                        draw_trace(ui, &self.trace, avail.y);
+                    }
                 }
             });
 
@@ -787,10 +841,11 @@ fn strip_value(ui: &mut egui::Ui, name: &str, value: &Option<String>) {
 /// down (tg's orientation). Rate error shows as a rising or falling drift,
 /// beat error splits tic/toc into two horizontal bands, noise widens the
 /// scatter.
-fn draw_trace(ui: &mut egui::Ui, trace: &[TracePoint]) {
-    let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
+fn draw_trace(ui: &mut egui::Ui, trace: &[TracePoint], height: f32) {
+    let size = egui::vec2(ui.available_size().x, height);
+    let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
     let rect = resp.rect;
-    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(10, 11, 12));
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(15, 16, 18));
     // Phase-error window: +/- 25 ms, ticks wrap into it.
     const WINDOW_MS: f64 = 25.0;
     const SPAN_S: f64 = 60.0;
@@ -827,10 +882,7 @@ fn draw_trace(ui: &mut egui::Ui, trace: &[TracePoint]) {
         } else {
             egui::Color32::from_rgb(240, 140, 240)
         };
-        painter.line_segment(
-            [egui::pos2(x, y - 1.5), egui::pos2(x, y + 1.5)],
-            egui::Stroke::new(1.6_f32, color),
-        );
+        painter.circle_filled(egui::pos2(x, y), 2.0, color);
     }
 }
 
@@ -896,10 +948,11 @@ fn draw_trend(ui: &mut egui::Ui, history: &[(std::time::Instant, f64)], height: 
 }
 
 /// Empty-state hint shown before any tick has been found.
-fn draw_listening(ui: &mut egui::Ui, mic_live: Option<bool>) {
-    let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
+fn draw_listening(ui: &mut egui::Ui, mic_live: Option<bool>, height: f32) {
+    let size = egui::vec2(ui.available_size().x, height);
+    let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
     let rect = resp.rect;
-    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(10, 11, 12));
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(15, 16, 18));
     let msg = match mic_live {
         Some(false) => "mic: no input — check the device",
         _ => "listening… rest the watch on the microphone",
@@ -913,37 +966,130 @@ fn draw_listening(ui: &mut egui::Ui, mic_live: Option<bool>) {
     );
 }
 
-fn draw_waveform(ui: &mut egui::Ui, result: &Option<TimingResult>, height: f32) {
+/// tg's tick scope view: the folded acoustic waveform centered on the tick,
+/// -25 ms .. +10 ms, with a 1 ms time graticule below the axis and an
+/// amplitude-degree graticule above it (the rotation time the balance needs
+/// to sweep the lift angle). The envelope is mirrored, stroked and filled.
+fn draw_scope(
+    ui: &mut egui::Ui,
+    wf: &[f32],
+    center: usize,
+    label: &str,
+    color: egui::Color32,
+    period: f64,
+    lift: f64,
+    height: f32,
+) {
     let size = egui::vec2(ui.available_size().x, height);
     let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
-    painter.rect_filled(resp.rect, 4.0, egui::Color32::from_gray(16));
-    let Some(r) = result else { return };
-    let wf = &r.waveform;
-    if wf.is_empty() {
+    let rect = resp.rect;
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(15, 16, 18));
+    let max = wf.iter().cloned().fold(0f32, f32::max);
+    if wf.is_empty() || max <= 0.0 {
         return;
     }
-    let max = wf.iter().cloned().fold(0f32, f32::max).max(1e-9);
-    let rect = resp.rect;
-    let n = wf.len();
-    let mid = rect.center().y;
-    let to_screen = |i: usize, v: f32| {
-        egui::pos2(
-            rect.left() + (i as f32 / n as f32) * rect.width(),
-            mid - (v / max) * (rect.height() / 2.0 - 4.0),
-        )
-    };
-    let points: Vec<egui::Pos2> = wf.iter().enumerate().map(|(i, &v)| to_screen(i, v)).collect();
-    painter.add(egui::Shape::line(
-        points,
-        egui::Stroke::new(1.5_f32, egui::Color32::LIGHT_GREEN),
-    ));
-    if let Some(tic) = r.tic {
-        let x = to_screen(tic, 0.0).x;
+    const NEG_MS: f64 = 25.0;
+    const POS_MS: f64 = 10.0;
+    let sr = crate::SAMPLE_RATE as f64;
+    let period_s = period / sr;
+    let w = rect.width();
+    let cy = rect.center().y;
+    let x_of = |t_ms: f64| rect.left() + ((t_ms + NEG_MS) / (NEG_MS + POS_MS) * w as f64) as f32;
+
+    // Time graticule: 1 ms ticks under the axis, red + numbered every 5 ms.
+    let minor = egui::Color32::from_rgb(45, 85, 60);
+    let major = egui::Color32::from_rgb(150, 70, 70);
+    for i_ms in -(NEG_MS as i32)..(POS_MS as i32) {
+        let x = x_of(i_ms as f64);
+        let col = if i_ms % 5 == 0 { major } else { minor };
         painter.line_segment(
-            [egui::pos2(x, rect.top() + 2.0), egui::pos2(x, rect.bottom() - 2.0)],
-            egui::Stroke::new(1.0_f32, egui::Color32::YELLOW),
+            [egui::pos2(x, cy), egui::pos2(x, rect.bottom() - 2.0)],
+            egui::Stroke::new(1.0_f32, col),
         );
+        if i_ms % 5 == 0 && i_ms != 0 {
+            painter.text(
+                egui::pos2(x + 2.0, rect.bottom() - 3.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("{i_ms}"),
+                egui::FontId::monospace(9.0),
+                egui::Color32::from_gray(120),
+            );
+        }
     }
+    painter.text(
+        egui::pos2(rect.right() - 4.0, rect.bottom() - 3.0),
+        egui::Align2::RIGHT_BOTTOM,
+        "ms",
+        egui::FontId::monospace(9.0),
+        egui::Color32::from_gray(120),
+    );
+
+    // Amplitude graticule: how long the balance takes to sweep 10°..350°,
+    // ms mapped to the left of the tick; red + numbered every 50°.
+    for amp in (10..360usize).step_by(10) {
+        if (amp as f64 + amp as f64) < lift {
+            continue;
+        }
+        let t_ms = period_s * (lift / (2.0 * amp as f64)).asin() / std::f64::consts::PI * 1000.0;
+        if t_ms > NEG_MS {
+            continue;
+        }
+        let x = x_of(-t_ms);
+        let col = if amp % 50 == 0 { major } else { minor };
+        painter.line_segment(
+            [egui::pos2(x, rect.top() + 2.0), egui::pos2(x, cy)],
+            egui::Stroke::new(1.0_f32, col),
+        );
+        if amp % 50 == 0 {
+            painter.text(
+                egui::pos2(x + 2.0, rect.top() + 3.0),
+                egui::Align2::LEFT_TOP,
+                format!("{amp}"),
+                egui::FontId::monospace(9.0),
+                egui::Color32::from_gray(120),
+            );
+        }
+    }
+    painter.text(
+        egui::pos2(rect.right() - 4.0, rect.top() + 3.0),
+        egui::Align2::RIGHT_TOP,
+        "deg",
+        egui::FontId::monospace(9.0),
+        egui::Color32::from_gray(120),
+    );
+
+    // Mirrored envelope of the folded waveform, stroked and filled (tg's
+    // draw_graph: peaks reach 40% of the chart height from the axis).
+    let a = center as f64 - NEG_MS / 1000.0 * sr;
+    let b = center as f64 + POS_MS / 1000.0 * sr;
+    let n = wf.len() as f64;
+    let mut pts: Vec<egui::Pos2> = Vec::with_capacity(w as usize * 2);
+    for i in 0..w as u32 {
+        let t = a + (b - a) * (i as f64 / w as f64);
+        let j = t.rem_euclid(n) as usize % n as usize;
+        let k = (wf[j] / max) as f64 * 0.4 * rect.height() as f64;
+        pts.push(egui::pos2(rect.left() + i as f32, cy - k as f32));
+    }
+    for i in (0..w as u32).rev() {
+        let t = a + (b - a) * (i as f64 / w as f64);
+        let j = t.rem_euclid(n) as usize % n as usize;
+        let k = (wf[j] / max) as f64 * 0.4 * rect.height() as f64;
+        pts.push(egui::pos2(rect.left() + i as f32, cy + k as f32));
+    }
+    let fill = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 48);
+    painter.add(egui::Shape::Path(egui::epaint::PathShape {
+        points: pts,
+        closed: true,
+        fill,
+        stroke: egui::Stroke::new(1.5_f32, color).into(),
+    }));
+    painter.text(
+        egui::pos2(rect.left() + 6.0, rect.top() + 3.0),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::monospace(9.0),
+        color,
+    );
 }
 
 fn main() -> anyhow::Result<()> {
