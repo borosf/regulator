@@ -175,16 +175,24 @@ impl RegulatorApp {
             };
             let demo_samples = watch.generate(SAMPLE_RATE, 120.0);
             let block = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize;
-            let mut start = 0usize;
+            
             let mut win_start_s = 0.0f64;
             let mut last_event_s = 0.0f64;
             let mut trace: Vec<TracePoint> = Vec::new();
+            // tg's window cascade: 2, 4, 8, 16 s trailing windows,
+            // analyzed from the last good step, climbing while
+            // sigma < period/10000, falling back on failure. The longest
+            // passing window's result is the measurement (tg's
+            // compute_update).
+            const CASCADE_S: [f64; 4] = [2.0, 4.0, 8.0, 16.0];
+            let mut step: usize = 0;
+            // Demo playhead (slides 1 s per cycle; loops).
+            let mut demo_head: usize = 0;
+            let mut demo_epoch: usize = 0;
             // Next-generation detection chain state.
             let mut tracker = V2Tracker::new(SAMPLE_RATE);
             let mut fed_until: u64 = 0;
             let mut last_v2 = None;
-            // Absolute sample position of the demo signal (it loops).
-            let mut demo_pos: u64 = 0;
             let mut cal_state = CalibrationState::new();
             let mut cal_cooldown = 0u32;
             let mut cal_fed_until: u64 = 0;
@@ -251,25 +259,39 @@ impl RegulatorApp {
                 // The demo signal drives the app only when no microphone
                 // capture is available, so the interface stays usable on any
                 // machine without a hardware toggle.
-                // One window per iteration, from whichever source is
-                // live, with its absolute sample position.
-                let window: Option<(u64, Vec<f32>)> = if ring.is_none() {
-                    let end = (start + block).min(demo_samples.len());
-                    let w = demo_samples[start..end].to_vec();
-                    let s = demo_pos;
-                    demo_pos += w.len() as u64;
-                    if end == demo_samples.len() {
-                        start = 0;
+                // Trailing tail of the live source (up to the largest
+                // cascade window), with its absolute sample position.
+                let src_tail: Option<(u64, Vec<f32>)> = if ring.is_none() {
+                    // Demo: last min(played-this-pass, 16) seconds ending
+                    // at the playhead.
+                    let take = demo_epoch.min(16 * SAMPLE_RATE as usize);
+                    let begin = demo_head - take;
+                    // demo_head lives in absolute-consumed space; map into
+                    // the looping buffer only within this pass.
+                    let pass_pos = demo_epoch;
+                    let w = if begin == 0 && pass_pos == 0 {
+                        Vec::new()
                     } else {
-                        start = end;
+                        let lo = pass_pos.saturating_sub(take);
+                        demo_samples[lo..pass_pos].to_vec()
+                    };
+                    demo_head += SAMPLE_RATE as usize; // slide 1 s
+                    demo_epoch += SAMPLE_RATE as usize;
+                    if demo_head % demo_samples.len() < SAMPLE_RATE as usize {
+                        demo_epoch = SAMPLE_RATE as usize; // looped
                     }
-                    Some((s, w))
+                    if w.is_empty() {
+                        None
+                    } else {
+                        Some(((demo_head - w.len()) as u64, w))
+                    }
                 } else if let Some(ring) = &ring {
                     let buf = ring.lock().unwrap_or_else(|e| e.into_inner());
-                    if buf.data.len() >= block {
+                    if buf.data.len() >= 2 * SAMPLE_RATE as usize {
+                        let take = buf.data.len().min(16 * SAMPLE_RATE as usize);
                         Some((
-                            buf.total - block as u64,
-                            buf.data[buf.data.len() - block..].to_vec(),
+                            buf.total - take as u64,
+                            buf.data[buf.data.len() - take..].to_vec(),
                         ))
                     } else {
                         None
@@ -277,44 +299,93 @@ impl RegulatorApp {
                 } else {
                     None
                 };
-                let res = window.as_ref().and_then(|(_, w)| analyzer.analyze(w));
-                if let Some((s, _)) = &window {
-                    win_start_s = *s as f64 / SAMPLE_RATE as f64;
+
+                // tg's cascade: analyze from the last good step, climb on
+                // a tight sigma, fall back on failure; the longest passing
+                // window is the measurement.
+                // One step per cycle (cost is spread like tg's
+                // per-interval computations): a passing step promotes
+                // the cascade to the next-larger window for the next
+                // cycle; a failure demotes it. The result shown is the
+                // step analyzed this cycle.
+                let mut res: Option<(u64, TimingResult)> = None;
+                if let Some((abs_start, tail)) = &src_tail {
+                    let mut s_step = step.min(3);
+                    if tail.len() < (CASCADE_S[s_step] * SAMPLE_RATE as f64) as usize
+                        && s_step > 0
+                    {
+                        s_step -= 1;
+                    }
+                    let need = (CASCADE_S[s_step] * SAMPLE_RATE as f64) as usize;
+                    if tail.len() >= need {
+                        let w = &tail[tail.len() - need..];
+                        let ws = *abs_start + (tail.len() - need) as u64;
+                        let r = analyzer.analyze(w).filter(|r| r.sigma < r.period / 10000.0);
+                        match r {
+                            Some(r) => {
+                                res = Some((ws, r));
+                                // Promote for the next cycle.
+                            }
+                            None => {
+                                if s_step == 0 {
+                                    res = None;
+                                } else {
+                                    // Demote; the failing longer window's
+                                    // result is not used (tg keeps the
+                                    // last good one for the readout).
+                                    let prev = step.min(s_step.saturating_sub(1));
+                                    let need_prev =
+                                        (CASCADE_S[prev] * SAMPLE_RATE as f64) as usize;
+                                    if tail.len() >= need_prev {
+                                        let w = &tail[tail.len() - need_prev..];
+                                        let ws = *abs_start + (tail.len() - need_prev) as u64;
+                                        res = analyzer
+                                            .analyze(w)
+                                            .filter(|r| r.sigma < r.period / 10000.0)
+                                            .map(|r| (ws, r));
+                                    }
+                                    s_step = prev;
+                                }
+                            }
+                        }
+                    }
+                    if res.is_some() && s_step < 3 {
+                        s_step += 1;
+                    }
+                    step = s_step;
+                }
+                if let Some((ws, _r)) = &res {
+                    win_start_s = *ws as f64 / SAMPLE_RATE as f64;
                 }
 
-                // v2 detection chain: fed the same, non-overlapping
-                // windows. When it locks, its template-matched events
-                // drive the trace (better localization at low noise, and
-                // it acquires on signals far too faint for the v1
-                // estimator, where its rate becomes the readout).
+                // v2 detection chain: fed non-overlapping 4-second
+                // windows from the same tail. When it locks, its
+                // template-matched events drive the trace, and when the
+                // cascade cannot lock at all (faint signal), its rate
+                // becomes the readout.
                 tracker.bph_hint = p2.bph;
                 tracker.calibration = p2.calibration;
-                if let Some((s, w)) = &window {
-                    if *s >= fed_until {
-                        let r2 = tracker.push_block(w, *s);
-                        fed_until = s + w.len() as u64;
-                        last_v2 = Some(r2);
+                if let Some((abs_start, tail)) = &src_tail {
+                    if tail.len() >= 4 * SAMPLE_RATE as usize {
+                        let ws = abs_start + tail.len() as u64 - 4 * SAMPLE_RATE as u64;
+                        if ws >= fed_until {
+                            let w = tail[tail.len() - 4 * SAMPLE_RATE as usize..].to_vec();
+                            let r2 = tracker.push_block(&w, ws);
+                            fed_until = ws + w.len() as u64;
+                            last_v2 = Some(r2);
+                        }
                     }
                 }
                 let use_v2_events = tracker.locked();
-                // The rate estimate of record: the v2 tracker accumulates
-                // per-block run regressions for the whole session (an
-                // estimator, not one 4-second block), converging with an
-                // honest standard error; the v1 per-block estimate only
-                // stands in until the tracker locks.
-                let session_rate = tracker.rate();
+                // The measurement of record is tg's cascade result; the
+                // v2 tracker's session estimate stands in only when the
+                // cascade cannot lock at all.
                 let combined: Option<TimingResult> = match &res {
-                    Some(r) => {
-                        let mut c = r.clone();
-                        if let Some(sr_) = session_rate {
-                            c.rate_sday = Some(sr_);
-                        }
-                        Some(c)
-                    }
+                    Some((_, r)) => Some(r.clone()),
                     None => match &last_v2 {
                         Some(r2) if r2.locked => Some(TimingResult {
                             period: r2.period,
-                            rate_sday: session_rate.or(r2.rate_sday),
+                            rate_sday: tracker.rate().or(r2.rate_sday),
                             beat_error_ms: None,
                             amplitude_deg: None,
                             sigma: 0.0,
@@ -326,6 +397,27 @@ impl RegulatorApp {
                         _ => None,
                     },
                 };
+                if !use_v2_events {
+                    if let Some((_, r)) = &res {
+                        let p0 = 7200.0 * SAMPLE_RATE as f64 / r.bph as f64;
+                        for (ev, is_tic) in &r.events {
+                            let t = win_start_s + ev / SAMPLE_RATE as f64;
+                            if t <= last_event_s {
+                                continue;
+                            }
+                            last_event_s = t;
+                            let mut e = (ev % p0) / p0 - 0.5;
+                            if e < -0.5 {
+                                e += 1.0;
+                            }
+                            trace.push(TracePoint {
+                                t,
+                                phase_ms: e * (2.0 * 3600.0 / r.bph as f64) * 1000.0,
+                                tic: *is_tic,
+                            });
+                        }
+                    }
+                }
                 if use_v2_events {
                     if let Some(r2) = &last_v2 {
                         let period_s = r2.period / SAMPLE_RATE as f64;
@@ -345,24 +437,6 @@ impl RegulatorApp {
                                 tic: ev.tic,
                             });
                         }
-                    }
-                } else if let Some(r) = &res {
-                    let p0 = 7200.0 * SAMPLE_RATE as f64 / r.bph as f64;
-                    for (ev, is_tic) in &r.events {
-                        let t = win_start_s + ev / SAMPLE_RATE as f64;
-                        if t <= last_event_s {
-                            continue;
-                        }
-                        last_event_s = t;
-                        let mut e = (ev % p0) / p0 - 0.5;
-                        if e < -0.5 {
-                            e += 1.0;
-                        }
-                        trace.push(TracePoint {
-                            t,
-                            phase_ms: e * (2.0 * 3600.0 / r.bph as f64) * 1000.0,
-                            tic: *is_tic,
-                        });
                     }
                 }
                 while let Some(first) = trace.first() {
@@ -670,7 +744,7 @@ fn main() -> anyhow::Result<()> {
                     let ring: Ring = Arc::new(Mutex::new(MicBuf { data: Vec::new(), total: 0 }));
                     let r = ring.clone();
                     std::thread::spawn(move || {
-                        let cap = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize * 2;
+                        let cap = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize * 8;
                         while let Ok(s) = rx.recv() {
                             r.lock().unwrap_or_else(|e| e.into_inner()).push(s, cap);
                         }

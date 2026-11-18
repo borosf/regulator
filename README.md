@@ -32,7 +32,10 @@ cargo test
 2. Pick the beat rate, or leave it on auto (the detected rate is shown
    once the signal locks).
 3. Set the lift angle for the movement (52° is a safe default).
-4. Read the rate. The trace confirms it: a rising drift means fast, a
+4. Read the rate — regulator measures with tg's exact window cascade
+   (2/4/8/16-second trailing windows, climbing while the period
+   estimate's confidence is tight, falling back when it isn't), so the
+   displayed value settles the same way tg's does. The trace confirms it: a rising drift means fast, a
    falling drift means slow, two horizontal bands mean beat error.
    (tic green, toc magenta)
 5. To calibrate the sound card, click "calibrate (quartz)" and place a
