@@ -37,6 +37,10 @@ struct Feed {
     result: Option<TimingResult>,
     trace: Vec<TracePoint>,
     cal: Option<CalView>,
+    /// tg-style signal level: 0..4, the cascade step that passed.
+    signal: u32,
+    /// Whether microphone samples are still arriving (None = not mic).
+    mic_live: Option<bool>,
 }
 
 const SAMPLE_RATE: u32 = 44100;
@@ -133,6 +137,17 @@ impl Default for Params {
 struct MicBuf {
     data: Vec<f32>,
     total: u64,
+    updated: std::time::Instant,
+}
+
+impl Default for MicBuf {
+    fn default() -> Self {
+        MicBuf {
+            data: Vec::new(),
+            total: 0,
+            updated: std::time::Instant::now(),
+        }
+    }
 }
 
 #[cfg(feature = "audio")]
@@ -140,6 +155,7 @@ impl MicBuf {
     fn push(&mut self, s: f32, cap: usize) {
         self.data.push(s);
         self.total += 1;
+        self.updated = std::time::Instant::now();
         if self.data.len() > cap {
             self.data.drain(..cap / 2);
         }
@@ -153,8 +169,14 @@ struct RegulatorApp {
     trace: Vec<TracePoint>,
     cal: Option<CalView>,
     last_export: Option<String>,
-    /// Live microphone capture exists (false: demo signal fallback).
-    has_mic: bool,
+    /// tg-style signal level 0..4 (which cascade window passed).
+    signal: u32,
+    /// True while the readout is frozen (space).
+    held: bool,
+    /// Whether microphone samples are still arriving (None = not mic).
+    mic_live: Option<bool>,
+    /// Rate trend for the side panel: (when, s/day) of the last 5 min.
+    history: Vec<(std::time::Instant, f64)>,
     params: Arc<Mutex<Params>>,
     rx: mpsc::Receiver<Feed>,
 }
@@ -163,7 +185,6 @@ impl RegulatorApp {
     fn new(ring: Option<Ring>) -> Self {
         let params = Arc::new(Mutex::new(Params::load()));
         let (tx, rx) = mpsc::channel::<Feed>();
-        let has_mic = ring.is_some();
         let params_arc = params.clone();
         std::thread::spawn(move || {
             let watch = SyntheticWatch {
@@ -242,7 +263,13 @@ impl RegulatorApp {
                         estimate: cal_state.estimate(),
                     };
                     drop(p);
-                    let _ = tx.send(Feed { result: None, trace: Vec::new(), cal: Some(view) });
+                    let _ = tx.send(Feed {
+                        result: None,
+                        trace: Vec::new(),
+                        cal: Some(view),
+                        signal: 0,
+                        mic_live: None,
+                    });
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
@@ -400,9 +427,10 @@ impl RegulatorApp {
                 if !use_v2_events {
                     if let Some((_, r)) = &res {
                         let p0 = 7200.0 * SAMPLE_RATE as f64 / r.bph as f64;
+                        let quarter = (2.0 * 3600.0 / r.bph as f64) / 4.0;
                         for (ev, is_tic) in &r.events {
                             let t = win_start_s + ev / SAMPLE_RATE as f64;
-                            if t <= last_event_s {
+                            if t <= last_event_s + quarter {
                                 continue;
                             }
                             last_event_s = t;
@@ -421,9 +449,14 @@ impl RegulatorApp {
                 if use_v2_events {
                     if let Some(r2) = &last_v2 {
                         let period_s = r2.period / SAMPLE_RATE as f64;
+                        // tg's event deadband: a quarter period, so
+                        // the same tick is never added twice with a
+                        // slightly different measured time when windows
+                        // overlap.
+                        let quarter = period_s / 4.0;
                         for ev in &r2.events {
                             let t = ev.t / SAMPLE_RATE as f64;
-                            if t <= last_event_s {
+                            if t <= last_event_s + quarter {
                                 continue;
                             }
                             last_event_s = t;
@@ -446,10 +479,30 @@ impl RegulatorApp {
                         break;
                     }
                 }
-                                let _ = tx.send(Feed {
+                                // tg's signal semantics: step+1 for a passing window,
+                // 0 when nothing passed.
+                let sig = if res.is_some() {
+                    step as u32 + 1
+                } else if tracker.locked() {
+                    1
+                } else {
+                    0
+                };
+                let mic_live = if ring.is_some() {
+                    ring.as_ref().map(|r| {
+                        r.lock()
+                            .map(|b| b.updated.elapsed().as_secs_f64() < 2.0)
+                            .unwrap_or(false)
+                    })
+                } else {
+                    None
+                };
+                let _ = tx.send(Feed {
                     result: combined,
                     trace: trace.clone(),
                     cal: None,
+                    signal: sig.min(4),
+                    mic_live,
                 });
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -459,7 +512,10 @@ impl RegulatorApp {
             trace: Vec::new(),
             cal: None,
             last_export: None,
-            has_mic,
+            signal: 0,
+            held: false,
+            mic_live: None,
+            history: Vec::new(),
             params,
             rx,
         }
@@ -468,13 +524,36 @@ impl RegulatorApp {
 
 impl eframe::App for RegulatorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Keyboard: space = hold/resume, e = export. Controls that free
+        // the watchmaker's hands while a measurement settles.
+        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            self.held = !self.held;
+        }
+        let mut want_export = false;
+        if ctx.input(|i| i.key_pressed(egui::Key::E)) {
+            want_export = true;
+        }
         while let Ok(feed) = self.rx.try_recv() {
+            if self.held {
+                // Frozen: drain worker output without applying it, so the
+                // readout and trace keep exactly what was held.
+                continue;
+            }
             self.result = feed.result;
             self.trace = feed.trace;
+            self.signal = feed.signal;
+            self.mic_live = feed.mic_live;
             if feed.cal.is_some() {
                 self.cal = feed.cal;
             } else {
                 self.cal = None;
+            }
+            if let Some(r) = &self.result {
+                if let Some(v) = r.rate_sday {
+                    let now = std::time::Instant::now();
+                    self.history.retain(|(t, _)| now.duration_since(*t).as_secs_f64() < 300.0);
+                    self.history.push((now, v));
+                }
             }
         }
         let mut visuals = egui::Visuals::dark();
@@ -506,9 +585,48 @@ impl eframe::App for RegulatorApp {
                         .color(color),
                 );
                 ui.label(egui::RichText::new("s/d").monospace().size(16.0).color(egui::Color32::GRAY));
+                // tg-style signal dots: filled per the cascade window that
+                // passed; one glance answers "is this reading solid?".
+                ui.add_space(10.0);
+                let (dot_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(52.0, 12.0),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter_at(dot_rect);
+                for i in 0..4 {
+                    let filled = (i as u32) < self.signal;
+                    let color = if !filled {
+                        egui::Color32::from_gray(50)
+                    } else if self.signal == 4 {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_rgb(235, 200, 90)
+                    };
+                    let cx = dot_rect.left() + 7.0 + i as f32 * 13.0;
+                    let cy = dot_rect.center().y;
+                    painter.circle_filled(egui::pos2(cx, cy), 5.0, color);
+                }
+                if self.signal > 0 {
+                    let win_s = [2u32, 4, 8, 16][(self.signal - 1) as usize];
+                    ui.label(
+                        egui::RichText::new(format!("w {win_s}s"))
+                            .monospace()
+                            .size(12.0)
+                            .color(egui::Color32::from_gray(110)),
+                    );
+                }
+                if self.held {
+                    ui.label(
+                        egui::RichText::new("HELD")
+                            .monospace()
+                            .strong()
+                            .size(14.0)
+                            .color(egui::Color32::from_rgb(235, 200, 90)),
+                    );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let p = self.params.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    if ui.button("export").clicked() {
+                    if ui.button("export").clicked() || want_export {
                         self.last_export = chart::export_chart(&self.trace, &self.result, &self.params);
                     }
                     if let Some(path) = &self.last_export {
@@ -519,10 +637,15 @@ impl eframe::App for RegulatorApp {
                                 .color(egui::Color32::from_rgb(120, 220, 120)),
                         );
                     }
+                    let mode = match self.mic_live {
+                        Some(false) => "mic: no input".to_string(),
+                        Some(true) => "mic".to_string(),
+                        None => "demo".to_string(),
+                    };
                     ui.label(
                         egui::RichText::new(format!(
                             "{}  {}",
-                            if self.has_mic { "mic" } else { "demo" },
+                            mode,
                             match p.bph {
                                 0 => match self.result.as_ref().map(|r| r.bph) {
                                     Some(b) => format!("auto (detected {b} bph)"),
@@ -623,6 +746,13 @@ impl eframe::App for RegulatorApp {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("WAVEFORM").small().weak());
                 draw_waveform(ui, &self.result, 90.0);
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("RATE TREND (5 min)").small().weak());
+                draw_trend(ui, &self.history, 110.0);
+                ui.add_space(6.0);
+                ui.checkbox(&mut self.held, "hold (space)");
             });
 
         // Center: the strip chart, or live calibration feedback while
@@ -632,6 +762,8 @@ impl eframe::App for RegulatorApp {
             .show(ctx, |ui| {
                 if let Some(cal) = &self.cal {
                     chart::draw_cal_view(ui, cal);
+                } else if self.trace.is_empty() {
+                    draw_listening(ui, self.mic_live);
                 } else {
                     draw_trace(ui, &self.trace);
                 }
@@ -699,6 +831,85 @@ fn draw_trace(ui: &mut egui::Ui, trace: &[TracePoint]) {
     }
 }
 
+/// Rate trend: the last 5 minutes of s/day readings on an auto-ranged
+/// thin plot, so settling vs. drifting is obvious at a glance.
+fn draw_trend(ui: &mut egui::Ui, history: &[(std::time::Instant, f64)], height: f32) {
+    let size = egui::vec2(ui.available_size().x, height);
+    let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+    let rect = resp.rect;
+    painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(16, 18, 20));
+    if history.len() < 2 {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let span = 300.0_f64;
+    let (lo, hi) = {
+        let mut lo = f64::MAX;
+        let mut hi = f64::MIN;
+        for (_, v) in history {
+            lo = lo.min(*v);
+            hi = hi.max(*v);
+        }
+        if hi - lo < 1.0 {
+            let mid = (hi + lo) / 2.0;
+            (mid - 0.5, mid + 0.5)
+        } else {
+            (lo, hi)
+        }
+    };
+    let y_of = |v: f64| {
+        rect.bottom() - 4.0 - ((v - lo) / (hi - lo) * (rect.height() - 8.0) as f64) as f32
+    };
+    if lo <= 0.0 && 0.0 <= hi {
+        let y = y_of(0.0);
+        painter.line_segment(
+            [egui::pos2(rect.left() + 4.0, y), egui::pos2(rect.right() - 4.0, y)],
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(45)),
+        );
+    }
+    let to_px = |t: f64, v: f64| egui::pos2(
+        rect.left() + 4.0 + (t / span * (rect.width() - 8.0) as f64) as f32,
+        y_of(v),
+    );
+    let pts: Vec<egui::Pos2> = history
+        .iter()
+        .map(|(when, v)| (now.duration_since(*when).as_secs_f64(), *v))
+        .filter(|(t, _)| *t < span)
+        .map(|(t, v)| to_px(t, v))
+        .collect();
+    if pts.len() >= 2 {
+        painter.add(egui::Shape::line(
+            pts,
+            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(140, 220, 180)),
+        ));
+    }
+    painter.text(
+        egui::pos2(rect.left() + 6.0, rect.top() + 4.0),
+        egui::Align2::LEFT_TOP,
+        format!("{:+.1} … {:+.1}", lo, hi),
+        egui::FontId::monospace(10.0),
+        egui::Color32::from_gray(110),
+    );
+}
+
+/// Empty-state hint shown before any tick has been found.
+fn draw_listening(ui: &mut egui::Ui, mic_live: Option<bool>) {
+    let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
+    let rect = resp.rect;
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(10, 11, 12));
+    let msg = match mic_live {
+        Some(false) => "mic: no input — check the device",
+        _ => "listening… rest the watch on the microphone",
+    };
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        msg,
+        egui::FontId::monospace(16.0),
+        egui::Color32::from_gray(90),
+    );
+}
+
 fn draw_waveform(ui: &mut egui::Ui, result: &Option<TimingResult>, height: f32) {
     let size = egui::vec2(ui.available_size().x, height);
     let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
@@ -741,7 +952,7 @@ fn main() -> anyhow::Result<()> {
             let (tx, rx) = mpsc::channel::<f32>();
             match audio::spawn_capture(tx) {
                 Ok(()) => {
-                    let ring: Ring = Arc::new(Mutex::new(MicBuf { data: Vec::new(), total: 0 }));
+                    let ring: Ring = Arc::new(Mutex::new(MicBuf::default()));
                     let r = ring.clone();
                     std::thread::spawn(move || {
                         let cap = (BLOCK_SECONDS * SAMPLE_RATE as f64) as usize * 8;

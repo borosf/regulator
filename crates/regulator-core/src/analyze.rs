@@ -38,6 +38,11 @@ pub struct TimingResult {
 struct FftCache {
     plans: HashMap<usize, Arc<dyn Fft<f32>>>,
     scratch: Vec<Complex<f32>>,
+    /// Reusable complex work buffer (the dominant allocation of the
+    /// pipeline: 2n complex values per autocorrelation — 22 MB at the
+    /// 16-second cascade window; reusing it removes that from every
+    /// cycle).
+    work: Vec<Complex<f32>>,
 }
 
 impl FftCache {
@@ -45,6 +50,7 @@ impl FftCache {
         FftCache {
             plans: HashMap::new(),
             scratch: Vec::new(),
+            work: Vec::new(),
         }
     }
 
@@ -77,6 +83,14 @@ pub(crate) fn snap_bph(detected: f64) -> f64 {
         .unwrap_or(28800.0)
 }
 
+/// Reusable scratch of the noise suppressor (three window-length vectors
+/// per call otherwise).
+struct NoiseScratch {
+    sq: Vec<f32>,
+    b: Vec<f32>,
+    a: Vec<f32>,
+}
+
 /// Configurable analyzer. Reuse one instance across blocks; it caches FFT
 /// plans and reuses scratch buffers.
 pub struct Analyzer {
@@ -93,6 +107,7 @@ pub struct Analyzer {
     lpf: Biquad,
     hpf: Biquad,
     fft: RefCell<FftCache>,
+    noise: RefCell<NoiseScratch>,
     last_sigma: Cell<f64>,
 }
 
@@ -109,6 +124,11 @@ impl Analyzer {
             lpf: Biquad::low_pass(crate::FILTER_CUTOFF / sample_rate as f64),
             hpf: Biquad::high_pass(crate::FILTER_CUTOFF / sample_rate as f64),
             fft: RefCell::new(FftCache::new()),
+            noise: RefCell::new(NoiseScratch {
+                sq: Vec::new(),
+                b: Vec::new(),
+                a: Vec::new(),
+            }),
             last_sigma: Cell::new(0.0),
         }
     }
@@ -209,7 +229,7 @@ impl Analyzer {
         let sr = self.sample_rate as usize;
         self.hpf.run(s);
         if self.noise_suppressor {
-            Self::noise_suppressor(s, sr);
+            self.noise_suppressor(s);
         }
         for v in s.iter_mut() {
             *v = v.abs();
@@ -230,12 +250,17 @@ impl Analyzer {
 
     /// Zero out samples in windows whose energy greatly exceeds the median
     /// window energy (impulsive noise gating), ported from tg.
-    fn noise_suppressor(s: &mut [f32], sr: usize) {
+    fn noise_suppressor(self: &Analyzer, s: &mut [f32]) {
+        let sr = self.sample_rate as usize;
         let n = s.len();
         let window = sr / 50;
-        let sq: Vec<f32> = s.iter().map(|v| v * v).collect();
+        let scratch = &mut *self.noise.borrow_mut();
+        let (sq, b, mut a) = (&mut scratch.sq, &mut scratch.b, &mut scratch.a);
+        sq.clear();
+        sq.extend(s.iter().map(|v| v * v));
+        b.clear();
+        b.resize(n, 0.0);
         let mut r_av: f64 = sq[..window].iter().map(|&v| v as f64).sum();
-        let mut b = vec![0f32; n];
         for i in 0..n {
             b[i] = r_av as f32;
             if i + window == n {
@@ -245,7 +270,8 @@ impl Analyzer {
         }
         let m = n - window + 1;
         let step = sr / 2;
-        let mut a = Vec::with_capacity(m / step + 1);
+        a.clear();
+        a.reserve(m / step + 1);
         let mut i = 0;
         while i + step <= m {
             a.push(vmax(&b, i, i + step).0);
@@ -274,16 +300,33 @@ impl Analyzer {
         let forward = fft.plan(2 * n, FftDirection::Forward);
         let inverse = fft.plan(2 * n, FftDirection::Inverse);
         let scratch_len = forward.get_inplace_scratch_len().max(inverse.get_inplace_scratch_len());
-        fft.scratch.resize(scratch_len, Complex::default());
-        let mut buf: Vec<Complex<f32>> = s.iter().map(|&v| Complex::new(v, 0.0)).collect();
-        buf.resize(2 * n, Complex::default());
-        forward.process_with_scratch(&mut buf, &mut fft.scratch);
-        for c in buf.iter_mut() {
+        if fft.scratch.len() != scratch_len {
+            fft.scratch.resize(scratch_len, Complex::default());
+        }
+        if fft.work.len() != 2 * n {
+            fft.work.clear();
+            fft.work.resize(2 * n, Complex::default());
+        }
+        let cache = &mut *fft;
+        let work = &mut cache.work;
+        let scratch = &mut cache.scratch;
+        for (c, &v) in work.iter_mut().zip(s.iter()) {
+            *c = Complex::new(v, 0.0);
+        }
+        for c in work[s.len()..].iter_mut() {
+            *c = Complex::default();
+        }
+        forward.process_with_scratch(work, scratch);
+        for c in work.iter_mut() {
             *c = *c * c.conj();
         }
-        inverse.process_with_scratch(&mut buf, &mut fft.scratch);
-        buf.truncate(n);
-        buf.iter().map(|c| c.re).collect()
+        inverse.process_with_scratch(work, scratch);
+        work.truncate(n);
+        let out: Vec<f32> = work.iter().map(|c| c.re).collect();
+        // Keep the buffer sized for the next call; truncation above only
+        // shrank the logical view, and the capacity is retained.
+        work.resize(2 * n, Complex::default());
+        out
     }
 
     /// Parabolic interpolation around an integer peak of `ac` for a
