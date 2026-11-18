@@ -476,13 +476,7 @@ impl RegulatorApp {
                         }
                     }
                 }
-                while let Some(first) = trace.first() {
-                    if first.t < win_start_s - 120.0 {
-                        trace.remove(0);
-                    } else {
-                        break;
-                    }
-                }
+                trace.retain(|p| p.t >= win_start_s - 65.0);
                                 // tg's signal semantics: step+1 for a passing window,
                 // 0 when nothing passed.
                 let sig = if res.is_some() {
@@ -1058,31 +1052,23 @@ fn draw_scope(
         egui::Color32::from_gray(120),
     );
 
-    // Mirrored envelope of the folded waveform, stroked and filled (tg's
-    // draw_graph: peaks reach 40% of the chart height from the axis).
+    // Single crisp scope line: the folded waveform oscillating around the
+    // axis, peaks at 40% of the chart height (tg's draw_graph scaling).
     let a = center as f64 - NEG_MS / 1000.0 * sr;
     let b = center as f64 + POS_MS / 1000.0 * sr;
     let n = wf.len() as f64;
-    let mut pts: Vec<egui::Pos2> = Vec::with_capacity(w as usize * 2);
+    let half = rect.height() / 2.0;
+    let mut pts: Vec<egui::Pos2> = Vec::with_capacity(w as usize);
     for i in 0..w as u32 {
         let t = a + (b - a) * (i as f64 / w as f64);
-        let j = t.rem_euclid(n) as usize % n as usize;
-        let k = (wf[j] / max) as f64 * 0.4 * rect.height() as f64;
-        pts.push(egui::pos2(rect.left() + i as f32, cy - k as f32));
+        let j = t.rem_euclid(n) as usize;
+        let k = (wf[j] / max) * 0.9 * half;
+        pts.push(egui::pos2(rect.left() + i as f32, cy - k));
     }
-    for i in (0..w as u32).rev() {
-        let t = a + (b - a) * (i as f64 / w as f64);
-        let j = t.rem_euclid(n) as usize % n as usize;
-        let k = (wf[j] / max) as f64 * 0.4 * rect.height() as f64;
-        pts.push(egui::pos2(rect.left() + i as f32, cy + k as f32));
-    }
-    let fill = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 48);
-    painter.add(egui::Shape::Path(egui::epaint::PathShape {
-        points: pts,
-        closed: true,
-        fill,
-        stroke: egui::Stroke::new(1.5_f32, color).into(),
-    }));
+    painter.add(egui::Shape::line(
+        pts,
+        egui::Stroke::new(1.5_f32, color),
+    ));
     painter.text(
         egui::pos2(rect.left() + 6.0, rect.top() + 3.0),
         egui::Align2::LEFT_TOP,
