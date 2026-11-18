@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate the regulator icon: a clean R on a dark rounded square."""
-import struct, zlib, math, os
+"""Generate the regulator icon: a white monospaced lowercase r on black."""
+import struct, zlib, os
 
 SS = 3  # supersample factor
 
@@ -11,37 +11,28 @@ def render(size):
     s = size / 256.0
 
     def rrect(x, y):
-        # dark rounded square, margin 16, radius 56
+        # black rounded square, margin 16, radius 56
         m, r = 16 * s, 56 * s
         dx = max(m - x, x - (size - m), 0)
         dy = max(m - y, y - (size - m), 0)
         return dx * dx + dy * dy <= r * r
 
-    def seg_dist(px_, py_, ax, ay, bx, by):
-        vx, vy = bx - ax, by - ay
-        t = max(0.0, min(1.0, ((px_ - ax) * vx + (py_ - ay) * vy) / (vx * vx + vy * vy)))
-        qx, qy = ax + t * vx, ay + t * vy
-        return math.hypot(px_ - qx, py_ - qy)
-
     def letter(x, y):
         x, y = x / s, y / s  # work in 256-space
-        # stem: x 80..112, y 72..184
-        if 74 <= x <= 112 and 72 <= y <= 184:
+        # monospaced lowercase r: vertical stem, small shoulder bowl
+        # baseline y=184, x-height top y=88
+        # stem: x 98..130, full x-height to baseline
+        if 98 <= x <= 130 and 88 <= y <= 184:
             return True
-        # bowl: half-annulus centered (104,104), outer r 62, inner r 32
-        dx, dy = x - 104, y - 104
-        if dx >= 0 and 32 * 32 <= dx * dx + dy * dy <= 62 * 62 and dy <= 8:
-            return True
-        # join stem to bowl bottom at mid height
-        if 104 <= x <= 112 and 104 <= y <= 140:
-            return True
-        # leg: from (114,136) to (174,184), half-width 15
-        if seg_dist(x, y, 114, 136, 174, 184) <= 15:
+        # bowl: quarter-annulus centered (102,124), outer r 36, inner r 8,
+        # sweeping from the stem top out to the right
+        dx, dy = x - 102, y - 124
+        if dx >= 0 and dy <= 4 and 8 * 8 <= dx * dx + dy * dy <= 36 * 36:
             return True
         return False
 
-    bg = (14, 16, 18)
-    fg = (140, 230, 140)
+    bg = (0, 0, 0)
+    fg = (255, 255, 255)
     for iy in range(size):
         for ix in range(size):
             hit = acc = 0
